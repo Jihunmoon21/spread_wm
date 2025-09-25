@@ -22,7 +22,7 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: ./checkpoints  # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+ckpt_base_path: /home/jihun/dino_wm/outputs  # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: null
 model_epoch: latest
 

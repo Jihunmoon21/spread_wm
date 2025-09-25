@@ -290,27 +290,6 @@ class Trainer:
             if not self.train_decoder:
                 for param in self.decoder.parameters():
                     param.requires_grad = False
-        if getattr(self.cfg, "lora", None) and self.cfg.lora.enabled:
-            add_lora_to_linear_layers(
-                self.encoder,
-                r=self.cfg.lora.rank,
-                alpha=self.cfg.lora.alpha,
-                dropout=self.cfg.lora.dropout,
-            )
-            if self.cfg.has_predictor and self.predictor is not None:
-                add_lora_to_linear_layers(
-                    self.predictor,
-                    r=self.cfg.lora.rank,
-                    alpha=self.cfg.lora.alpha,
-                    dropout=self.cfg.lora.dropout,
-                )
-            if self.cfg.has_decoder and self.decoder is not None:
-                add_lora_to_linear_layers(
-                    self.decoder,
-                    r=self.cfg.lora.rank,
-                    alpha=self.cfg.lora.alpha,
-                    dropout=self.cfg.lora.dropout,
-                )
 
         self.encoder, self.predictor, self.decoder = self.accelerator.prepare(
             self.encoder, self.predictor, self.decoder

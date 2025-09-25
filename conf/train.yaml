@@ -69,12 +69,6 @@ model:
   train_predictor: True
   train_decoder: True
 
-lora:
-  enabled: false
-  rank: 4
-  alpha: 1.0
-  dropout: 0.0
-
 debug: False
 
 # Planning params for planning eval jobs launched during training
