@@ -24,7 +24,7 @@ hydra:
 # model to load for planning
 ckpt_base_path: ./checkpoints # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: point_maze_dinov2
-model_epoch: 30
+model_epoch: latest
 
 seed: 99
 n_evals: 50 

@@ -7,164 +7,133 @@
 #       -- Xiwen Wei
 # ------------------------------------------
 
-import math
+# models/lora.py
 
-# import timm
+import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from safetensors import safe_open
-from safetensors.torch import save_file
-# from timm.models.vision_transformer import VisionTransformer as ViT # ?
-# from timm.models.swin_transformer import SwinTransformer as timm_swin
-from torch import Tensor
-from torch.nn.parameter import Parameter
-
 from models.vit import ViTPredictor as ViT
 
-
-class _LoRALayer(nn.Module):
-    def __init__(self, w: nn.Module, w_a: nn.Module, w_b: nn.Module, wnew_a: nn.Module, wnew_b: nn.Module):
-        super().__init__()
-        self.w = w
-        self.w_a = w_a
-        self.w_b = w_b
-        self.wnew_a = wnew_a
-        self.wnew_b = wnew_b
-
-    def forward(self, x, use_new=True):
-        x = self.w(x) + self.w_b(self.w_a(x))
-        if use_new:
-            x += self.wnew_b(self.wnew_a(x))
-        return x
-
-
 class _LoRA_qkv_timm(nn.Module):
-    """In timm it is implemented as
-    self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-
-    B, N, C = x.shape
-    qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv.unbind(0)
-
-    """
-
-    def __init__(
-        self,
-        qkv: nn.Module,
-        linear_a_q: nn.Module,
-        linear_b_q: nn.Module,
-        linear_a_v: nn.Module,
-        linear_b_v: nn.Module,
-        linear_new_a_q: nn.Module,
-        linear_new_b_q: nn.Module,
-        linear_new_a_v: nn.Module,
-        linear_new_b_v: nn.Module,
-    ):
+    def __init__(self, qkv: nn.Module, online_mode: bool = True):
         super().__init__()
         self.qkv = qkv
-        self.linear_a_q = linear_a_q
-        self.linear_b_q = linear_b_q
-        self.linear_a_v = linear_a_v
-        self.linear_b_v = linear_b_v
-        self.linear_new_a_q = linear_new_a_q
-        self.linear_new_b_q = linear_new_b_q
-        self.linear_new_a_v = linear_new_a_v
-        self.linear_new_b_v = linear_new_b_v
+        self.online_mode = online_mode
         self.dim = qkv.in_features
-        self.w_identity = torch.eye(qkv.in_features)
+        
+        # 일반 LoRA 가중치 (A, B)
+        self.lora_a_q = None
+        self.lora_b_q = None
+        self.lora_a_v = None
+        self.lora_b_v = None
 
-    def forward(self, x, use_new=True):
+        # 온라인 LoRA 전용 가중치
+        if self.online_mode:
+            self.w_a_q = None
+            self.w_b_q = None
+            self.w_a_v = None
+            self.w_b_v = None
+            self.wnew_a_q = None
+            self.wnew_b_q = None
+            self.wnew_a_v = None
+            self.wnew_b_v = None
+
+    def forward(self, x):
         qkv = self.qkv(x)
-        new_q = self.linear_b_q(self.linear_a_q(x))
-        new_v = self.linear_b_v(self.linear_a_v(x))
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
 
-        q = qkv[:, :, : self.dim] + new_q
-        k = qkv[:, :, self.dim:-self.dim]            # 그대로 유지
-        v = qkv[:, :, -self.dim:] + new_v
-
-        if use_new:
-            q = q + self.linear_new_b_q(self.linear_new_a_q(x))
-            v = v + self.linear_new_b_v(self.linear_new_a_v(x))
-
+        if self.online_mode:
+            # 온라인 모드: w (고정) + w_new (학습)
+            q = q + self.w_b_q(self.w_a_q(x)) + self.wnew_b_q(self.wnew_a_q(x))
+            v = v + self.w_b_v(self.w_a_v(x)) + self.wnew_b_v(self.wnew_a_v(x))
+        else:
+            # 일반 모드: lora (학습)
+            q = q + self.lora_b_q(self.lora_a_q(x))
+            v = v + self.lora_b_v(self.lora_a_v(x))
+            
         return torch.cat([q, k, v], dim=-1)
 
 
-
 class LoRA_ViT_spread(nn.Module):
-    def __init__(self, vit_model: ViT, r: int = 4): # 2. 타입 힌트를 ViT (ViTPredictor)로 설정합니다.
+    def __init__(self, vit_model: ViT, r: int = 4, online_mode: bool = True):
         super(LoRA_ViT_spread, self).__init__()
-
         assert r > 0
-        self.w_As, self.w_Bs = [], []
-        self.wnew_As, self.wnew_Bs = [], []
+        self.online_mode = online_mode
 
-        # 기본 ViT 모델의 모든 파라미터를 동결시킵니다.
+        # 기본 ViT 모델의 모든 파라미터를 동결
         for param in vit_model.parameters():
             param.requires_grad = False
 
-        # 3. ViTPredictor 내부의 Transformer 레이어들을 순회하며 LoRA를 주입합니다.
-        #    경로: vit_model.transformer.layers
+        # LoRA 가중치를 저장할 리스트 초기화
+        self.lora_As = []
+        self.lora_Bs = []
+        if self.online_mode:
+            self.w_As, self.w_Bs = [], []
+            self.wnew_As, self.wnew_Bs = [], []
+
         for layer in vit_model.transformer.layers:
-            # SPREAD의 Transformer는 layer가 [Attention, FeedForward] 리스트로 구성됩니다.
-            # 따라서 첫 번째 요소인 Attention 모듈에 접근합니다.
             attn_block = layer[0]
-            # Attention 모듈 안의 qkv 계산 레이어 이름은 to_qkv 입니다.
             w_qkv_linear = attn_block.to_qkv
             dim = w_qkv_linear.in_features
             
-            # (이하 LoRA 가중치 생성 및 주입 로직은 이전과 동일)
-            w_a_linear_q = nn.Linear(dim, r, bias=False)
-            w_b_linear_q = nn.Linear(r, dim, bias=False)
-            w_a_linear_v = nn.Linear(dim, r, bias=False)
-            w_b_linear_v = nn.Linear(r, dim, bias=False)
-            wnew_a_linear_q = nn.Linear(dim, r, bias=False)
-            wnew_b_linear_q = nn.Linear(r, dim, bias=False)
-            wnew_a_linear_v = nn.Linear(dim, r, bias=False)
-            wnew_b_linear_v = nn.Linear(r, dim, bias=False)
-            for param in w_a_linear_q.parameters(): 
-                param.requires_grad = False
-            for param in w_a_linear_v.parameters(): 
-                param.requires_grad = False
-            for param in w_b_linear_q.parameters(): 
-                param.requires_grad = False
-            for param in w_b_linear_v.parameters(): 
-                param.requires_grad = False
+            # 기존 to_qkv 레이어를 LoRA 기능이 추가된 레이어로 교체
+            attn_block.to_qkv = _LoRA_qkv_timm(w_qkv_linear, online_mode=self.online_mode)
 
-            for param in wnew_a_linear_q.parameters(): param.requires_grad = True
-            for param in wnew_b_linear_q.parameters(): param.requires_grad = True
-            for param in wnew_a_linear_v.parameters(): param.requires_grad = True
-            for param in wnew_b_linear_v.parameters(): param.requires_grad = True
+            if self.online_mode:
+                # 온라인 LoRA 가중치 생성
+                w_a_q, w_b_q = nn.Linear(dim, r, bias=False), nn.Linear(r, dim, bias=False)
+                w_a_v, w_b_v = nn.Linear(dim, r, bias=False), nn.Linear(r, dim, bias=False)
+                wnew_a_q, wnew_b_q = nn.Linear(dim, r, bias=False), nn.Linear(r, dim, bias=False)
+                wnew_a_v, wnew_b_v = nn.Linear(dim, r, bias=False), nn.Linear(r, dim, bias=False)
+                
+                # w 가중치는 동결, w_new 가중치만 학습
+                for param in w_a_q.parameters(): param.requires_grad = False
+                for param in w_b_q.parameters(): param.requires_grad = False
+                for param in w_a_v.parameters(): param.requires_grad = False
+                for param in w_b_v.parameters(): param.requires_grad = False
+                
+                self.w_As.extend([w_a_q, w_a_v])
+                self.w_Bs.extend([w_b_q, w_b_v])
+                self.wnew_As.extend([wnew_a_q, wnew_a_v])
+                self.wnew_Bs.extend([wnew_b_q, wnew_b_v])
 
-            self.w_As.extend([w_a_linear_q, w_a_linear_v])
-            self.w_Bs.extend([w_b_linear_q, w_b_linear_v])
-            self.wnew_As.extend([wnew_a_linear_q, wnew_a_linear_v])
-            self.wnew_Bs.extend([wnew_b_linear_q, wnew_b_linear_v])
+                # _LoRA_qkv_timm 모듈에 가중치 할당
+                attn_block.to_qkv.w_a_q, attn_block.to_qkv.w_b_q = w_a_q, w_b_q
+                attn_block.to_qkv.w_a_v, attn_block.to_qkv.w_b_v = w_a_v, w_b_v
+                attn_block.to_qkv.wnew_a_q, attn_block.to_qkv.wnew_b_q = wnew_a_q, wnew_b_q
+                attn_block.to_qkv.wnew_a_v, attn_block.to_qkv.wnew_b_v = wnew_a_v, wnew_b_v
+            else:
+                # 일반 LoRA 가중치 생성 (모두 학습 가능)
+                lora_a_q, lora_b_q = nn.Linear(dim, r, bias=False), nn.Linear(r, dim, bias=False)
+                lora_a_v, lora_b_v = nn.Linear(dim, r, bias=False), nn.Linear(r, dim, bias=False)
+                
+                self.lora_As.extend([lora_a_q, lora_a_v])
+                self.lora_Bs.extend([lora_b_q, lora_b_v])
 
-            # 기존 to_qkv 레이어를 LoRA 기능이 추가된 레이어로 교체합니다.
-            attn_block.to_qkv = _LoRA_qkv_timm(
-                w_qkv_linear,
-                w_a_linear_q, w_b_linear_q, w_a_linear_v, w_b_linear_v,
-                wnew_a_linear_q, wnew_b_linear_q, wnew_a_linear_v, wnew_b_linear_v,
-            )
+                # _LoRA_qkv_timm 모듈에 가중치 할당
+                attn_block.to_qkv.lora_a_q, attn_block.to_qkv.lora_b_q = lora_a_q, lora_b_q
+                attn_block.to_qkv.lora_a_v, attn_block.to_qkv.lora_b_v = lora_a_v, lora_b_v
 
         self.lora_vit = vit_model
         self.reset_parameters()
-        
-        # 4. SPREAD ViT에는 별도의 mlp_head가 없으므로 해당 코드는 필요 없습니다.
-        #    대신, 학습이 필요한 pos_embedding의 동결을 해제합니다.
         self.lora_vit.pos_embedding.requires_grad = True
 
-
     def reset_parameters(self) -> None:
-        """LoRA 가중치를 초기화합니다."""
-        for w_A in self.w_As: nn.init.zeros_(w_A.weight)
-        for w_B in self.w_Bs: nn.init.zeros_(w_B.weight)
-        for wnew_A in self.wnew_As: nn.init.kaiming_uniform_(wnew_A.weight, a=math.sqrt(5))
-        for wnew_B in self.wnew_Bs: nn.init.zeros_(wnew_B.weight)
+        if self.online_mode:
+            for w_A in self.w_As: nn.init.zeros_(w_A.weight)
+            for w_B in self.w_Bs: nn.init.zeros_(w_B.weight)
+            for wnew_A in self.wnew_As: nn.init.kaiming_uniform_(wnew_A.weight, a=math.sqrt(5))
+            for wnew_B in self.wnew_Bs: nn.init.zeros_(wnew_B.weight)
+        else:
+            # 일반 LoRA 초기화 (논문 방식)
+            for lora_A in self.lora_As: nn.init.kaiming_uniform_(lora_A.weight, a=math.sqrt(5))
+            for lora_B in self.lora_Bs: nn.init.zeros_(lora_B.weight)
     
     def update_and_reset_lora_parameters(self):
-        """학습된 LoRA 가중치를 고정된 부분에 더하고, 학습 가능한 가중치는 다시 초기화합니다."""
+        if not self.online_mode:
+            print("Warning: update_and_reset_lora_parameters is called in non-online mode.")
+            return
+        
         with torch.no_grad():
             for i in range(len(self.w_As)):
                 self.w_As[i].weight.data += self.wnew_As[i].weight.data
@@ -174,7 +143,6 @@ class LoRA_ViT_spread(nn.Module):
         for wnew_B in self.wnew_Bs: nn.init.zeros_(wnew_B.weight)
 
     def forward(self, x: Tensor) -> Tensor:
-        """모델의 순전파를 정의합니다."""
         return self.lora_vit(x)
     
 # class LoRA_ViT(nn.Module):
