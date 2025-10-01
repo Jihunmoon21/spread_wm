@@ -31,8 +31,10 @@ class VWorldModel(nn.Module):
         self.encoder = encoder
         self.proprio_encoder = proprio_encoder
         self.action_encoder = action_encoder
+        # 외부에서 생성된 ViTPredictor 객체를 LoRA_ViT_spread 래퍼로 감싸줍니다.
         self.decoder = decoder  # decoder could be None
-        self.predictor = predictor  # predictor could be None
+        # self.predictor = predictor  # predictor could be None
+        self.predictor = LoRA_ViT_spread(vit_model=predictor, r=4)  # predictor could be None
         self.train_encoder = train_encoder
         self.train_predictor = train_predictor
         self.train_decoder = train_decoder
@@ -281,7 +283,6 @@ class VWorldModel(nn.Module):
             act_repeated = act_tiled.repeat(1, 1, 1, self.num_action_repeat)
             z[..., -self.action_dim:] = act_repeated
         return z
-
 
     def rollout(self, obs_0, act):
         """

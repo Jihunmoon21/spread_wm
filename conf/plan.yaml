@@ -1,6 +1,6 @@
 defaults:
   - _self_
-  - planner: cem
+  - planner: mpc_cem
   - override hydra/launcher: submitit_slurm
 
 hydra:
@@ -23,13 +23,13 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: /home/jihun/dino_wm # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+ckpt_base_path: /home/jihun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: null
 model_epoch: latest # 임의 조정
 
 seed: 99
-n_evals: 30
-goal_source: 'dset' # 'random_state' or 'dset' or 'random_action' 
+n_evals: 10 # 25
+goal_source: 'random_state' # 'random_state' or 'dset' or 'random_action' 
 goal_H: 5 # specifies how far away the goal is if goal_source is 'dset'
 n_plot_samples: 10
 

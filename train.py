@@ -22,7 +22,6 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from metrics.image_metrics import eval_images
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
-from models.lora import add_lora_to_linear_layers
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)

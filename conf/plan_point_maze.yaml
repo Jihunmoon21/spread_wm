@@ -13,8 +13,8 @@ hydra:
     nodes: 1
     tasks_per_node: 1
     cpus_per_task: 1
-    mem_gb: 16
-    gres: "gpu:rtx5060ti:1"
+    mem_gb: 256
+    gres: "gpu:h100:1"
     qos: "explore"
     timeout_min: 720
     setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
@@ -22,12 +22,12 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: ./checkpoints # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+ckpt_base_path: /home/jihun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: point_maze_dinov2
 model_epoch: latest
 
 seed: 99
-n_evals: 50 
+n_evals: 25
 goal_source: 'random_state'
 goal_H: 5
 n_plot_samples: 10
@@ -48,7 +48,7 @@ planner:
     target: planning.cem.CEMPlanner
     horizon: 5
     topk: 30
-    num_samples: 300 # 300
+    num_samples: 100 # 300
     var_scale: 1
     opt_steps: 10
     eval_every: 1
