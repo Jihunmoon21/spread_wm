@@ -14,12 +14,16 @@ from itertools import product
 from pathlib import Path
 from einops import rearrange
 from omegaconf import OmegaConf, open_dict
+from collections import OrderedDict
 
 from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
 from preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
 from utils import cfg_to_dict, seed
+
+from models.vit import ViTPredictor
+from models.lora import LoRA_ViT_spread
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -352,7 +356,7 @@ class PlanWorkspace:
 
 def load_ckpt(snapshot_path, device):
     with snapshot_path.open("rb") as f:
-        payload = torch.load(f, map_location=device, weights_only = False)
+        payload = torch.load(f, map_location=device, weights_only=False)
     loaded_keys = []
     result = {}
     for k, v in payload.items():
@@ -362,52 +366,151 @@ def load_ckpt(snapshot_path, device):
     result["epoch"] = payload["epoch"]
     return result
 
-
 def load_model(model_ckpt, train_cfg, num_action_repeat, device):
-    result = {}
-    if model_ckpt.exists():
-        result = load_ckpt(model_ckpt, device)
-        print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
+    # 1. 체크포인트 파일(.pth)을 불러옵니다.
+    if not model_ckpt.exists():
+        raise FileNotFoundError(f"Model checkpoint not found at {model_ckpt}")
+    print(f"Loading checkpoint from: {model_ckpt}")
+    payload = torch.load(model_ckpt, map_location=device, weights_only=False)
+    print(f"Resumed from epoch {payload.get('epoch', 'N/A')}")
 
-    if "encoder" not in result:
-        result["encoder"] = hydra.utils.instantiate(
-            train_cfg.encoder,
-        )
-    if "predictor" not in result:
-        raise ValueError("Predictor not found in model checkpoint")
+    # 2. payload에서 사전 학습된 모델 객체들을 직접 추출합니다.
+    encoder = payload.get("encoder")
+    base_predictor = payload.get("predictor")
+    decoder = payload.get("decoder")
+    proprio_encoder = payload.get("proprio_encoder")
+    action_encoder = payload.get("action_encoder")
 
-    if train_cfg.has_decoder and "decoder" not in result:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        if train_cfg.env.decoder_path is not None:
-            decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-            ckpt = torch.load(decoder_path)
-            if isinstance(ckpt, dict):
-                result["decoder"] = ckpt["decoder"]
-            else:
-                result["decoder"] = torch.load(decoder_path)
-        else:
-            raise ValueError(
-                "Decoder path not found in model checkpoint \
-                                and is not provided in config"
-            )
-    elif not train_cfg.has_decoder:
-        result["decoder"] = None
+    if base_predictor is None:
+        raise ValueError("Predictor not found in the loaded checkpoint payload.")
+    if encoder is None:
+        encoder = hydra.utils.instantiate(train_cfg.encoder)
 
+    def oc_get(cfg, key, default=None):
+        val = OmegaConf.select(cfg, key)  # 없으면 None 반환
+        return default if val is None else val
+
+    def to_bool(v):
+        if isinstance(v, bool): return v
+        if isinstance(v, str):  return v.strip().lower() in ("1","true","yes","on")
+        return bool(v) 
+    # OmegaConf.select로 존재 여부 확인 후 인스턴스화
+    if proprio_encoder is None and OmegaConf.select(train_cfg, "proprio_encoder") is not None:
+        proprio_encoder = hydra.utils.instantiate(train_cfg.proprio_encoder)
+
+    if action_encoder is None and OmegaConf.select(train_cfg, "action_encoder") is not None:
+        action_encoder = hydra.utils.instantiate(train_cfg.action_encoder)
+
+    # 3) LoRA 주입 여부 결정 (안전 가드 포함)
+    raw_flag  = oc_get(train_cfg, "lora.enabled", False)
+    use_lora  = to_bool(raw_flag)
+    rank      = oc_get(train_cfg, "lora.rank", 4)
+    online    = to_bool(oc_get(train_cfg, "lora.online", False))
+
+    # use_lora=False인데 이미 래핑되어 들어온 경우 강제 해제
+    if not use_lora and isinstance(base_predictor, LoRA_ViT_spread):
+        print("[LoRA] unwrap enforced (use_lora=False)")
+        base_predictor = base_predictor.lora_vit
+
+    # 이번 로더에서 주입(중복 방지)
+    if use_lora and isinstance(base_predictor, ViTPredictor) and not isinstance(base_predictor, LoRA_ViT_spread):
+        predictor = LoRA_ViT_spread(vit_model=base_predictor, r=rank, online_mode=online)
+        print(f"LoRA is enabled for the Predictor. rank={rank}, online={online}")
+    else:
+        predictor = base_predictor
+        print("LoRA is disabled.")
+
+    # (선택) 안전 확인: LoRA 비활성 시 래퍼가 남아있지 않도록
+    if not use_lora:
+        assert not isinstance(predictor, LoRA_ViT_spread), "LoRA wrapper present despite lora.enabled=False"
+
+    # 4. 전체 World Model을 조립합니다.
     model = hydra.utils.instantiate(
         train_cfg.model,
-        encoder=result["encoder"],
-        proprio_encoder=result["proprio_encoder"],
-        action_encoder=result["action_encoder"],
-        predictor=result["predictor"],
-        decoder=result["decoder"],
+        encoder=encoder,
+        proprio_encoder=proprio_encoder,
+        action_encoder=action_encoder,
+        predictor=predictor,
+        decoder=decoder,
         proprio_dim=train_cfg.proprio_emb_dim,
         action_dim=train_cfg.action_emb_dim,
         concat_dim=train_cfg.concat_dim,
         num_action_repeat=num_action_repeat,
         num_proprio_repeat=train_cfg.num_proprio_repeat,
     )
+    
+    # 5. 디코더를 별도 파일에서 불러와야 하는 경우의 처리
+    if train_cfg.has_decoder and decoder is None and train_cfg.env.get('decoder_path') is not None:
+        print("Loading decoder from separate path...")
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
+        ckpt = torch.load(decoder_path, map_location=device, weights_only=False)
+        model.decoder = ckpt.get("decoder", ckpt) if isinstance(ckpt, dict) else ckpt
+            
     model.to(device)
+    model.eval() # 모델을 평가 모드로 설정
     return model
+
+# def load_model(model_ckpt, train_cfg, num_action_repeat, device):
+#     result = {}
+#     if model_ckpt.exists():
+#         result = load_ckpt(model_ckpt, device)
+#         print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
+
+#     if "encoder" not in result:
+#         result["encoder"] = hydra.utils.instantiate(
+#             train_cfg.encoder,
+#         )
+#     if "predictor" not in result:
+#         raise ValueError("Predictor not found in model checkpoint")
+
+#     # # LoRA 주입
+#     # predictor = result["predictor"]
+#     # if getattr(train_cfg, "lora_enable", True) and isinstance(predictor, ViTPredictor):
+#     #     predictor = LoRA_ViT_spread(
+#     #         predictor,
+#     #         r=getattr(train_cfg, "lora_rank", 4),
+#     #         online_mode=getattr(train_cfg, "lora_online", True),
+#     #     ).to(device)
+#     # if isinstance(predictor, ViTPredictor):
+#     #     # 필요 시 r 값/online_mode는 cfg에서 받도록 하세요.
+#     #     predictor = LoRA_ViT_spread(predictor, r=getattr(train_cfg, "lora_rank", 4),
+#     #                                 online_mode=getattr(train_cfg, "lora_online", True))
+#     #     predictor = predictor.to(device)
+#     # result["predictor"] = predictor
+
+#     if train_cfg.has_decoder and "decoder" not in result:
+#         base_path = os.path.dirname(os.path.abspath(__file__))
+#         if train_cfg.env.decoder_path is not None:
+#             decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
+#             ckpt = torch.load(decoder_path)
+#             if isinstance(ckpt, dict):
+#                 result["decoder"] = ckpt["decoder"]
+#             else:
+#                 result["decoder"] = torch.load(decoder_path)
+#         else:
+#             raise ValueError(
+#                 "Decoder path not found in model checkpoint \
+#                                 and is not provided in config"
+#             )
+#     elif not train_cfg.has_decoder:
+#         result["decoder"] = None
+
+#     model = hydra.utils.instantiate(
+#         train_cfg.model,
+#         encoder=result["encoder"],
+#         proprio_encoder=result["proprio_encoder"],
+#         action_encoder=result["action_encoder"],
+#         predictor=result["predictor"],
+#         decoder=result["decoder"],
+#         proprio_dim=train_cfg.proprio_emb_dim,
+#         action_dim=train_cfg.action_emb_dim,
+#         concat_dim=train_cfg.concat_dim,
+#         num_action_repeat=num_action_repeat,
+#         num_proprio_repeat=train_cfg.num_proprio_repeat,
+#     )
+#     model.to(device)
+#     return model
 
 
 class DummyWandbRun:

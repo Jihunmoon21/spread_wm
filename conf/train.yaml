@@ -22,7 +22,7 @@ hydra:
     nodes: 1
     tasks_per_node: 1
     cpus_per_task: 8
-    mem_gb: 512
+    mem_gb: 16
     gres: "gpu:h100:1"
     timeout_min: 2880
     setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
@@ -79,3 +79,8 @@ plan_settings:
   goal_source: ['dset', 'random_state']
   goal_H: [5]
   alpha: [0.1, 1]
+  
+lora:
+  enabled: false # LoRA 자체를 사용할지 여부
+  online: false   # LoRA 사용 시, 온라인 모드를 쓸지 여부 (false면 일반 LoRA)
+  rank: 4        # LoRA의 rank

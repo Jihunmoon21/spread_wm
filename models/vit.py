@@ -3,6 +3,7 @@ import torch
 from torch import nn
 from einops import rearrange, repeat
 import torch.nn.functional as F
+from torch.cuda.amp import autocast
 
 # helpers
 NUM_FRAMES = 1
@@ -56,51 +57,48 @@ class Attention(nn.Module):
             nn.Linear(inner_dim, dim),
             nn.Dropout(dropout)
         ) if project_out else nn.Identity()
-        # self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')
+        self.bias = generate_mask_matrix(NUM_PATCHES, NUM_FRAMES).to('cuda')
     
     def forward(self, x):
-        B, T, C = x.size()
+        (
+            B,
+            T,
+            C,
+        ) = x.size()
         x = self.norm(x)
 
-        qkv = self.to_qkv(x).chunk(3, dim=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=self.heads), qkv)
-        # SDPA는 내부에서 1/sqrt(d) 스케일을 적용하므로, 기존 self.scale 곱 제거
+        qkv = self.to_qkv(x).chunk(3, dim = -1)
+        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
+        
+        amp_dtype = (torch.bfloat16 
+             if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8)
+             else torch.float16)
+        # autocast 컨텍스트를 사용하여 이 블록 내의 연산을 FP16으로 수행
+        # with torch.autocast(enabled=torch.cuda.is_available(), device_type="cuda", dtype=amp_dtype):
+        dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+            # (옵션) 플래닝 시에는 아래 causal mask 라인을 주석 처리해야 합니다.
+        dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
 
-        # (선택) 플래시/메모리 효율 커널 우선 사용
-        with torch.backends.cuda.sdp_kernel(enable_flash=True,
-                                            enable_mem_efficient=True,
-                                            enable_math=False):
-            attn = F.scaled_dot_product_attention(
-                q, k, v,
-                attn_mask=None,                         # 패딩 마스크가 있으면 여기에 전달(아래 참고)
-                dropout_p=self.dropout.p if self.training else 0.0,
-                is_causal=True                          # 기존 self.bias 삼각 마스크 대체
-            )
+        attn = self.attend(dots)
 
-        out = rearrange(attn, 'b h n d -> b n (h d)')
+        attn = self.dropout(attn)
+
+        out = torch.matmul(attn, v)
+        out = rearrange(out, 'b h n d -> b n (h d)')
         return self.to_out(out)
+        # attn_mask = (self.bias[:, :, :T, :T] == 0)
+        # with torch.backends.cuda.sdp_kernel(enable_flash=True,
+        #                                     enable_mem_efficient=True,
+        #                                     enable_math=False):
+        #     attn = F.scaled_dot_product_attention(
+        #         q, k, v,
+        #         attn_mask=attn_mask,
+        #         dropout_p=self.dropout.p if self.training else 0.0,
+        #         is_causal=False   # causal이면 True, 아니면 False + attn_mask 전달
+        #     )
+        # out = rearrange(attn, 'b h n d -> b n (h d)')
 
-    # def forward(self, x):
-    #     (
-    #         B,
-    #         T,
-    #         C,
-    #     ) = x.size()
-    #     x = self.norm(x)
-
-    #     qkv = self.to_qkv(x).chunk(3, dim = -1)
-    #     q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h = self.heads), qkv)
-
-    #     dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
-    #     # apply causal mask
-    #     dots = dots.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-
-    #     attn = self.attend(dots)
-    #     attn = self.dropout(attn)
-
-    #     out = torch.matmul(attn, v)
-    #     out = rearrange(out, 'b h n d -> b n (h d)')
-    #     return self.to_out(out)
+        # return self.to_out(out)
 
 class Transformer(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
