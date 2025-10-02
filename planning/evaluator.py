@@ -10,6 +10,7 @@ from utils import (
     aggregate_dct,
     move_to_device,
     concat_trajdict,
+    stack_trajdict,
 )
 from torchvision import utils
 
@@ -27,6 +28,10 @@ class PlanEvaluator:  # evaluator for planning
         seed,
         preprocessor,
         n_plot_samples,
+        # lora 관련 인자 추가
+        is_lora_enabled,
+        is_online_lora,
+        workspace,
     ):
         self.obs_0 = obs_0
         self.obs_g = obs_g
@@ -39,8 +44,24 @@ class PlanEvaluator:  # evaluator for planning
         self.preprocessor = preprocessor
         self.n_plot_samples = n_plot_samples
         self.device = next(wm.parameters()).device
-
         self.plot_full = False  # plot all frames or frames after frameskip
+
+        # lora 학습을 위한 관련 설정 초기화
+        self.is_lora_enabled = is_lora_enabled
+        self.is_online_lora = is_online_lora
+        self.workspace = workspace  # PlanWorkspace 인스턴스 참조
+
+        # action_dim을 workspace에서 안전하게 가져오기 (fallback 포함)
+        if self.workspace is not None and hasattr(self.workspace, "action_dim"):
+            self.action_dim = self.workspace.action_dim
+        else:
+            # 최후 수단: wm이나 preprocessor에서 유추 (환경별로 다를 수 있음)
+            self.action_dim = getattr(getattr(self.wm, "action_dim", None), "__int__", lambda: None)() or 0
+            
+        # workspace로부터 optimizer와 loss_fn 가져오기
+        if self.is_lora_enabled:
+            self.lora_optimizer = self.workspace.lora_optimizer
+            self.loss_fn = self.workspace.loss_fn
 
     def assign_init_cond(self, obs_0, state_0):
         self.obs_0 = obs_0
@@ -87,56 +108,179 @@ class PlanEvaluator:  # evaluator for planning
         self, actions, action_len=None, filename="output", save_video=False
     ):
         """
-        actions: detached torch tensors on cuda
+        actions: detached torch tensors on cuda, shape [B, T, F*D]
         Returns
             metrics, and feedback from env
         """
-        n_evals = actions.shape[0]
+        # ------------------------------ 기본 준비 ------------------------------
+        B, T, FD = actions.shape
+        F = self.frameskip
+        
+        assert FD % F == 0, f"Action dimension {FD} is not divisible by frameskip {F}"
+        D = FD // F
+        
         if action_len is None:
-            action_len = np.full(n_evals, np.inf)
-        # rollout in wm
-        trans_obs_0 = move_to_device(
-            self.preprocessor.transform_obs(self.obs_0), self.device
-        )
-        trans_obs_g = move_to_device(
-            self.preprocessor.transform_obs(self.obs_g), self.device
-        )
+            action_len = np.full(B, np.inf)
+
+        # 월드모델 비교용 rollout (추론 전용)
+        self.wm.eval()
         with torch.no_grad():
-            i_z_obses, _ = self.wm.rollout(
-                obs_0=trans_obs_0,
-                act=actions,
-            )
+            trans_obs_0 = move_to_device(self.preprocessor.transform_obs(self.obs_0), self.device)
+            trans_obs_g = move_to_device(self.preprocessor.transform_obs(self.obs_g), self.device)
+            i_z_obses, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions)  # [B, T+1, ...] 가정
         i_final_z_obs = self._get_trajdict_last(i_z_obses, action_len + 1)
 
-        # rollout in env
-        exec_actions = rearrange(
-            actions.cpu(), "b t (f d) -> b (t f) d", f=self.frameskip
-        )
-        exec_actions = self.preprocessor.denormalize_actions(exec_actions).numpy()
-        e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions)
-        e_visuals = e_obses["visual"]
-        e_final_obs = self._get_trajdict_last(e_obses, action_len * self.frameskip + 1)
-        e_final_state = self._get_traj_last(e_states, action_len * self.frameskip + 1)[
-            :, 0
-        ]  # reduce dim back
+        # 환경 실행용 액션 전개
+        # - Env에는 비정규화된 D차원 액션을 frameskip만큼 순차 공급
+        exec_actions = rearrange(actions.cpu(), "b t (f d) -> b t f d", f=F)  # [B, T, F, D]
+        exec_actions = self.preprocessor.denormalize_actions(exec_actions.reshape(B, T * F, D))
+        exec_actions = exec_actions.numpy().reshape(B, T, F, D)
 
-        # compute eval metrics
+        # ------------------------------ 헬퍼 ------------------------------
+        def _env_step_one(current_state, act_np):
+            """환경 한 스텝 실행. 다양한 API를 보수적으로 지원."""
+            # 선호: Gym 스타일 VectorEnv
+            if hasattr(self.env, "step"):
+                # act_np: [B, D]
+                obs, states = self.env.step(act_np)
+                return obs, states
+            # 커스텀: rollout_one_step(current_state, act)
+            if hasattr(self.env, "rollout_one_step"):
+                return self.env.rollout_one_step(current_state, act_np)
+            # 레거시: rollout(seed, state, actions_seq)
+            if hasattr(self.env, "rollout"):
+                # 1-step용으로 감싸서 호출 (seed는 가능한 외부에서 설정되어 있어야 함)
+                seed = getattr(self, "seed", None)
+                return self.env.rollout(seed, current_state, act_np[None, ...])
+            raise RuntimeError("Unsupported env API: need .step(...) or .rollout_one_step(...) or .rollout(...)")
+
+        def _wm_predict_one(prev_obs_tensor, action_step_tensor):
+            """WM 단일 스텝 예측: predict_one_step 우선, 없으면 rollout(H=1)로 대체."""
+            # action_step_tensor: [B, D] on device
+            if hasattr(self.wm, "predict_one_step"):
+                return self.wm.predict_one_step(prev_obs_tensor, action_step_tensor)  # dict of features
+            # fallback: rollout with H=1 (act needs shape [B, 1, D])
+            pred_seq, _ = self.wm.rollout(obs_0=prev_obs_tensor, act=action_step_tensor.unsqueeze(1))
+            # pred_seq가 dict(traj)라고 가정: 각 키에 대해 마지막 시점 추출
+            return {k: v[:, -1] for k, v in pred_seq.items()}
+
+        # ------------------------------ 온라인 루프 ------------------------------
+        all_e_obses_list, all_e_states_list = [], []
+        current_state = self.state_0
+        prev_obs = self.obs_0  # 다음 스텝 타깃 계산에 사용
+
+        for t in range(T):
+            # 현재 계획 스텝의 액션 분리
+            # - WM 업데이트용: 정규화 D차원 1-step
+            a_t_for_wm = actions[:, t, :].reshape(B, F, D)[:, 0, :]             # [B, D], 정규화 상태 그대로
+            # - Env 실행용: 비정규화 D차원 F-step
+            a_tf_for_env = exec_actions[:, t, :, :]                              # [B, F, D] (numpy, denorm)
+
+            # ----------- Env: frameskip만큼 실제 실행 -----------
+            obs_seq, state_seq = [], []
+            for f in range(F):
+                obs_f, state_f = _env_step_one(current_state, a_tf_for_env[:, f, :])
+                obs_seq.append(obs_f)
+                state_seq.append(state_f)
+                current_state = state_f  # 다음 프레임의 초기 상태
+
+            # [B, F, ...] 형태로 정리
+            obs = stack_trajdict(obs_seq)                 # 구현체에 맞춘 유틸: e.g., dict of arrays [B, F, ...]
+            states = np.stack(state_seq, axis=1)          # [B, F, state_dim]
+
+            # ----------- LoRA 온라인 업데이트 -----------
+            if getattr(self, "is_lora_enabled", False):
+                self.wm.train()
+                self.lora_optimizer.zero_grad()
+
+                # (a) 입력/타깃 준비
+                prev_obs_tensor = move_to_device(self.preprocessor.transform_obs(prev_obs), self.device)
+                true_next_obs_tensor = move_to_device(self.preprocessor.transform_obs(obs[:, -1]), self.device)  # F번째 관측
+
+                # (b) 예측/타깃 특징 추출 (타깃 인코딩은 no_grad + eval)
+                pred_feat = _wm_predict_one(prev_obs_tensor, a_t_for_wm.to(self.device))
+
+                with torch.no_grad():
+                    self.wm.eval()
+                    true_feat = self.wm.encode_obs(true_next_obs_tensor)
+
+                # (c) 손실 계산
+                loss_v = self.loss_fn(pred_feat["visual"],  true_feat["visual"])
+                loss_p = self.loss_fn(pred_feat["proprio"], true_feat["proprio"])
+                loss = loss_v + loss_p
+
+                # (d) 역전파/업데이트
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in self.wm.parameters() if p.requires_grad], max_norm=1.0
+                )
+                self.wm.train()
+                self.lora_optimizer.step()
+                self.wm.eval()  # 이후 추론 일관성
+                # 매 스텝(t)마다 LoRA 학습 손실 값을 출력합니다.
+                
+                print(f"[LoRA Training] Step: {t}, Loss: {loss.item():.4f}")
+                # ==========================================================
+
+                self.wm.train()
+                self.lora_optimizer.step()
+                self.wm.eval()
+
+                # (e) Online LoRA plateau 감지 (컨트롤러 우선)
+                if getattr(self, "is_online_lora", False):
+                    if hasattr(self, "online_lora"):
+                        # 권장: 컨트롤러 객체에 위임
+                        self.online_lora.on_step(loss.item(), getattr(self.wm, "predictor", self.wm))
+                    elif hasattr(self, "workspace"):
+                        # 레거시: workspace의 loss_window 사용
+                        ws = self.workspace
+                        if not hasattr(ws, "loss_window"):
+                            from collections import deque
+                            ws.loss_window = deque(maxlen=getattr(ws, "loss_window_length", 5))
+                        ws.loss_window.append(loss.item())
+                        mean, var = np.mean(ws.loss_window), np.var(ws.loss_window)
+                        if (not getattr(ws, "new_peak_detected", True)) and mean > getattr(ws, "last_loss_window_mean", 1e9) + np.sqrt(getattr(ws, "last_loss_window_variance", 1e9)):
+                            ws.new_peak_detected = True
+                        if mean < getattr(ws, "mean_threshold", 5.6) and var < getattr(ws, "variance_threshold", 0.08) and getattr(ws, "new_peak_detected", True):
+                            print("INFO: Loss plateau detected. Updating and resetting Online LoRA weights.")
+                            predictor = getattr(self.wm, "predictor", self.wm)
+                            if hasattr(predictor, "update_and_reset_lora_parameters"):
+                                predictor.update_and_reset_lora_parameters()
+                            ws.last_loss_window_mean, ws.last_loss_window_variance = mean, var
+                            ws.new_peak_detected = False
+
+            # ----------- 버퍼 업데이트 -----------
+            all_e_obses_list.append(obs)         # [B, F, ...]
+            all_e_states_list.append(states)     # [B, F, ...]
+            prev_obs = obs[:, -1]                # 다음 스텝의 prev로 사용
+
+        # ------------------------------ 결과 정리 ------------------------------
+        e_obses = concat_trajdict(all_e_obses_list)             # [B, T*F, ...] 형태로 합치도록 구현
+        e_states = np.concatenate(all_e_states_list, axis=1)    # [B, T*F, state_dim]
+        e_visuals = e_obses["visual"]
+
+        e_final_obs   = self._get_trajdict_last(e_obses, action_len * F + 1)
+        e_final_state = self._get_traj_last(e_states, action_len * F + 1)[:, 0]
+
         logs, successes = self._compute_rollout_metrics(
             e_state=e_final_state,
             e_obs=e_final_obs,
             i_z_obs=i_final_z_obs,
         )
 
-        # plot trajs
-        if self.wm.decoder is not None:
-            i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
-            i_visuals = self._mask_traj(
-                i_visuals, action_len + 1
-            )  # we have action_len + 1 states
-            e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
-            e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
+        # ------------------------------ 시각화 ------------------------------
+        if getattr(self.wm, "decoder", None) is not None:
+            self.wm.eval()
+            with torch.no_grad():
+                i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+            i_visuals = self._mask_traj(i_visuals, action_len + 1)
+
+            e_visuals_transformed = self.preprocessor.transform_obs_visual(e_visuals)
+            e_visuals_transformed = self._mask_traj(
+                e_visuals_transformed, action_len * F + 1
+            )
             self._plot_rollout_compare(
-                e_visuals=e_visuals,
+                e_visuals=e_visuals_transformed,
                 i_visuals=i_visuals,
                 successes=successes,
                 save_video=save_video,
@@ -144,6 +288,39 @@ class PlanEvaluator:  # evaluator for planning
             )
 
         return logs, successes, e_obses, e_states
+
+
+        # e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions)
+        # e_visuals = e_obses["visual"]
+        # e_final_obs = self._get_trajdict_last(e_obses, action_len * self.frameskip + 1)
+        # e_final_state = self._get_traj_last(e_states, action_len * self.frameskip + 1)[
+        #     :, 0
+        # ]  # reduce dim back
+
+        # # compute eval metrics
+        # logs, successes = self._compute_rollout_metrics(
+        #     e_state=e_final_state,
+        #     e_obs=e_final_obs,
+        #     i_z_obs=i_final_z_obs,
+        # )
+
+        # # plot trajs
+        # if self.wm.decoder is not None:
+        #     i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+        #     i_visuals = self._mask_traj(
+        #         i_visuals, action_len + 1
+        #     )  # we have action_len + 1 states
+        #     e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
+        #     e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
+        #     self._plot_rollout_compare(
+        #         e_visuals=e_visuals,
+        #         i_visuals=i_visuals,
+        #         successes=successes,
+        #         save_video=save_video,
+        #         filename=filename,
+        #     )
+
+        # return logs, successes, e_obses, e_states
 
     def _compute_rollout_metrics(self, e_state, e_obs, i_z_obs):
         """
