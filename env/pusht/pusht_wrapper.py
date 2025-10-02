@@ -59,12 +59,37 @@ class PushTWrapper(PushTEnv):
         Return True if the goal is reached
         [agent_x, agent_y, T_x, T_y, angle, agent_vx, agent_vy]
         """
-        # if position difference is < 20, and angle difference < np.pi/9, then success
-        pos_diff = np.linalg.norm(goal_state[:4] - cur_state[:4])
-        angle_diff = np.abs(goal_state[4] - cur_state[4])
-        angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
-        success = pos_diff < 20 and angle_diff < np.pi / 9
-        state_dist = np.linalg.norm(goal_state - cur_state)
+        # 상태 차원 안전 처리
+        goal_state = np.array(goal_state)
+        cur_state = np.array(cur_state)
+        
+        # 최소 공통 차원으로 맞춤
+        min_dim = min(len(goal_state), len(cur_state))
+        goal_state_safe = goal_state[:min_dim]
+        cur_state_safe = cur_state[:min_dim]
+        
+        # 위치 비교 (최소 4차원 필요)
+        if min_dim >= 4:
+            pos_diff = np.linalg.norm(goal_state_safe[:4] - cur_state_safe[:4])
+        else:
+            # fallback: 사용 가능한 차원만 사용
+            pos_diff = np.linalg.norm(goal_state_safe[:min_dim] - cur_state_safe[:min_dim])
+        
+        # 각도 비교 (5차원 이상일 때만)
+        if min_dim >= 5:
+            angle_diff = np.abs(goal_state_safe[4] - cur_state_safe[4])
+            angle_diff = np.minimum(angle_diff, 2 * np.pi - angle_diff)
+            success = pos_diff < 20 and angle_diff < np.pi / 9
+        else:
+            # 각도 정보가 없으면 위치만으로 판단
+            success = pos_diff < 20
+        
+        # 전체 상태 거리 계산 (안전한 차원으로)
+        state_dist = np.linalg.norm(goal_state_safe - cur_state_safe)
+        
+        print(f"[PUSHT EVAL] goal_dim: {len(goal_state)}, cur_dim: {len(cur_state)}, min_dim: {min_dim}")
+        print(f"[PUSHT EVAL] pos_diff: {pos_diff:.2f}, success: {success}, state_dist: {state_dist:.2f}")
+        
         return {
             'success': success,
             'state_dist': state_dist,

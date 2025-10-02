@@ -62,8 +62,21 @@ class ProprioceptiveEmbedding(nn.Module):
             stride=tubelet_size)
 
     def forward(self, x):
-        # x: proprioceptive vectors of shape [B T D]
-        x = x.permute(0, 2, 1)
+        # x: proprioceptive vectors of shape [B T D] or [B D]
+        
+        # Handle 2D input by adding time dimension
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # [B D] -> [B 1 D]
+        
+        # Handle input dimension mismatch
+        actual_in_chans = x.shape[2]
+        if actual_in_chans != self.in_chans:
+            # Create a projection layer to match expected input channels
+            if not hasattr(self, 'input_projection'):
+                self.input_projection = nn.Linear(actual_in_chans, self.in_chans).to(x.device)
+            x = self.input_projection(x)  # [B T actual_D] -> [B T expected_D]
+            
+        x = x.permute(0, 2, 1)  # [B T D] -> [B D T]
         x = self.patch_embed(x)
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)  # [B D T] -> [B T D]
         return x

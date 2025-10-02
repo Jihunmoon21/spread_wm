@@ -106,17 +106,10 @@ class MPCPlanner(BasePlanner):
 
             print(f"MPC iter {self.iter} Eval ------- ")
             action_so_far = torch.cat(self.planned_actions, dim=1)
-            
-            # 🔧 수정: 첫 번째 iteration에서만 초기 조건 설정
-            if self.iter == 0:
-                print(f"[MPC FIX] Setting initial conditions for iter {self.iter}")
-                self.evaluator.assign_init_cond(
-                    obs_0=init_obs_0,
-                    state_0=init_state_0,
-                )
-            else:
-                print(f"[MPC FIX] Using updated conditions from previous iter for iter {self.iter}")
-            
+            self.evaluator.assign_init_cond(
+                obs_0=init_obs_0,
+                state_0=init_state_0,
+            )
             logs, successes, e_obses, e_states = self.evaluator.eval_actions(
                 action_so_far,
                 self.action_len,
@@ -141,7 +134,6 @@ class MPCPlanner(BasePlanner):
             e_final_obs = slice_trajdict_with_t(e_obses, start_idx=-1)
             cur_obs_0 = e_final_obs
             e_final_state = e_states[:, -1]
-            print(f"[MPC FIX] Updating conditions for next iter: final_state shape {e_final_state.shape}")
             self.evaluator.assign_init_cond(
                 obs_0=e_final_obs,
                 state_0=e_final_state,
