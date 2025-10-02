@@ -49,6 +49,21 @@ def concat_trajdict(dcts):
 ArrayLike = Union[np.ndarray, torch.Tensor]
 TrajDict = Dict[str, ArrayLike]
 
+def _ensure_same_keys(dcts: List[TrajDict]) -> None:
+    """모든 딕셔너리가 같은 키를 가지는지 확인"""
+    if len(dcts) <= 1:
+        return
+    
+    first_keys = set(dcts[0].keys())
+    for i, dct in enumerate(dcts[1:], 1):
+        if set(dct.keys()) != first_keys:
+            raise ValueError(f"Dictionary {i} has different keys: {set(dct.keys())} vs {first_keys}")
+
+def _is_torch(arr) -> bool:
+    """배열이 torch.Tensor인지 확인"""
+    import torch
+    return isinstance(arr, torch.Tensor)
+
 def stack_trajdict(dcts: List[TrajDict], axis: int = 1) -> TrajDict:
     """
     여러 시점(또는 블록)을 새 시간축처럼 쌓기.

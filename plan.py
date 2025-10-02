@@ -137,7 +137,7 @@ class PlanWorkspace:
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
         self.goal_H = cfg_dict["goal_H"]
-        self.action_dim = self.dset.action_dim * self.frameskip
+        self.action_dim = self.dset.action_dim
         self.debug_dset_init = cfg_dict["debug_dset_init"]
 
         objective_fn = hydra.utils.call(
@@ -167,9 +167,27 @@ class PlanWorkspace:
 
         if self.is_lora_enabled:
             print(f"INFO: LoRA training enabled (online: {self.is_online_lora}). Creating optimizer.")
-            params_to_train = filter(lambda p: p.requires_grad, self.wm.predictor.parameters())
-            params = [p for p in self.wm.predictor.parameters() if p.requires_grad]
-            assert len(params) > 0, "No trainable LoRA params; check wrapper init."
+            
+            # LoRA 학습 시 다른 모든 컴포넌트 동결
+            print("INFO: Freezing all non-LoRA parameters...")
+            for param in self.wm.encoder.parameters():
+                param.requires_grad = False
+            for param in self.wm.proprio_encoder.parameters():
+                param.requires_grad = False
+            for param in self.wm.action_encoder.parameters():
+                param.requires_grad = False
+            if self.wm.decoder is not None:
+                for param in self.wm.decoder.parameters():
+                    param.requires_grad = False
+            
+            # LoRA 파라미터만 학습하도록 필터링
+            params_to_train = [p for p in self.wm.parameters() if p.requires_grad]
+            total_trainable_params = sum(p.numel() for p in params_to_train)
+            total_model_params = sum(p.numel() for p in self.wm.parameters())
+            lora_ratio = (total_trainable_params / total_model_params) * 100 if total_model_params > 0 else 0
+            print(f"INFO: Found {len(params_to_train)} trainable parameter tensors ({total_trainable_params:,} parameters) for LoRA.")
+            print(f"INFO: LoRA parameters: {total_trainable_params:,} / Total model parameters: {total_model_params:,} ({lora_ratio:.4f}%)")
+            assert len(params_to_train) > 0, "No trainable LoRA params; check wrapper init."
             self.lora_optimizer = torch.optim.Adam(params_to_train, lr=cfg_dict.get("lora", {}).get("lr", 1e-4))
             self.loss_fn = torch.nn.MSELoss()
 
@@ -210,7 +228,7 @@ class PlanWorkspace:
             self.cfg_dict["planner"],
             wm=self.wm,
             env=self.env,
-            action_dim=self.action_dim,
+            action_dim=self.action_dim * self.frameskip,  # planner는 frameskip이 적용된 action_dim 필요
             objective_fn=objective_fn,
             preprocessor=self.data_preprocessor,
             evaluator=self.evaluator, # <- 이제 올바른 evaluator가 전달됩니다.
@@ -358,16 +376,38 @@ class PlanWorkspace:
             actions_init = self.gt_actions
         else:
             actions_init = None
+            
+        print(f"[PLAN.PY] Starting planning with planner type: {type(self.planner).__name__}")
+        print(f"[PLAN.PY] obs_0 shape: {self.obs_0['visual'].shape}")
+        print(f"[PLAN.PY] obs_g shape: {self.obs_g['visual'].shape}")
+        
         actions, action_len = self.planner.plan(
             obs_0=self.obs_0,
             obs_g=self.obs_g,
             actions=actions_init,
         )
+        
+        print(f"[PLAN.PY] Planning completed. Actions shape: {actions.shape}")
+        print(f"[PLAN.PY] Action length: {action_len}")
         logs, successes, _, _ = self.evaluator.eval_actions(
             actions.detach(), action_len, save_video=True, filename="output_final"
         )
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
+        
+        # 최종 결과 요약 출력
+        if 'final_eval/success' in logs:
+            final_success_rate = np.mean(logs['final_eval/success'])
+            final_avg_dist = np.mean(logs['final_eval/state_dist'])
+            print(f"\n{'='*60}")
+            print(f"FINAL PLANNING SUMMARY")
+            print(f"{'='*60}")
+            print(f"Success Rate: {final_success_rate:.2%}")
+            print(f"Average Distance to Goal: {final_avg_dist:.4f}")
+            print(f"Total Evaluations: {len(logs['final_eval/success'])}")
+            print(f"Successful Plans: {np.sum(logs['final_eval/success'])}")
+            print(f"{'='*60}\n")
+        
         logs_entry = {
             key: (
                 value.item()
@@ -603,26 +643,16 @@ def planning_main(cfg_dict):
     except Exception as e:
         print(f"[LoRA Check] error: {e}")
 
-    # use dummy vector env for wall and deformable envs
-    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
-        from env.serial_vector_env import SerialVectorEnv
-        env = SerialVectorEnv(
-            [
-                gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
-                for _ in range(cfg_dict["n_evals"])
-            ]
-        )
-    else:
-        env = SubprocVectorEnv(
-            [
-                lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-                )
-                for _ in range(cfg_dict["n_evals"])
-            ]
-        )
+    # Use SerialVectorEnv to avoid multiprocessing EOFError issues
+    from env.serial_vector_env import SerialVectorEnv
+    env = SerialVectorEnv(
+        [
+            gym.make(
+                model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+            )
+            for _ in range(cfg_dict["n_evals"])
+        ]
+    )
 
     plan_workspace = PlanWorkspace(
         cfg_dict=cfg_dict,

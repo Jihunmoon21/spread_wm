@@ -1,7 +1,7 @@
 _target_: planning.cem.CEMPlanner
 horizon: 5
 topk: 30
-num_samples: 300
+num_samples: 100
 var_scale: 1
 opt_steps: 30
 eval_every: 1

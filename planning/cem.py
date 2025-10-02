@@ -114,8 +114,22 @@ class CEMPlanner(BasePlanner):
                 topk_idx = torch.argsort(loss)[: self.topk]
                 topk_action = action[topk_idx]
                 losses.append(loss[topk_idx[0]].item())
+                
+                # 업데이트 전 값 저장
+                old_mu_norm = torch.norm(mu[traj]).item()
+                old_sigma_mean = torch.mean(sigma[traj]).item()
+                
                 mu[traj] = topk_action.mean(dim=0)
                 sigma[traj] = topk_action.std(dim=0)
+                
+                # 업데이트 후 값 확인
+                new_mu_norm = torch.norm(mu[traj]).item()
+                new_sigma_mean = torch.mean(sigma[traj]).item()
+                
+                print(f"[CEM DEBUG] Iter {i}, Traj {traj}: loss={loss[topk_idx[0]].item():.4f}")
+                print(f"[CEM DEBUG] mu_norm: {old_mu_norm:.4f} -> {new_mu_norm:.4f}")
+                print(f"[CEM DEBUG] sigma_mean: {old_sigma_mean:.4f} -> {new_sigma_mean:.4f}")
+                print(f"[CEM DEBUG] topk_losses: {loss[topk_idx][:5].tolist()}")
 
             self.wandb_run.log(
                 {f"{self.logging_prefix}/loss": np.mean(losses), "step": i + 1}

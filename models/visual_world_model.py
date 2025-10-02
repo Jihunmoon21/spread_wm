@@ -114,21 +114,67 @@ class VWorldModel(nn.Module):
         return z
     
     def encode_act(self, act):
+        # Convert to torch tensor if it's numpy array and move to correct device
+        if isinstance(act, torch.Tensor):
+            pass  # already tensor
+        else:
+            act = torch.tensor(act)
+        
+        # Ensure act is on the same device as the model
+        if hasattr(self.action_encoder, 'parameters'):
+            device = next(self.action_encoder.parameters()).device
+            act = act.to(device)
+            
         act = self.action_encoder(act) # (b, num_frames, action_emb_dim)
         return act
     
     def encode_proprio(self, proprio):
+        # Convert to torch tensor if it's numpy array and move to correct device
+        if isinstance(proprio, torch.Tensor):
+            pass  # already tensor
+        else:
+            proprio = torch.tensor(proprio)
+        
+        # Ensure proprio is on the same device as the model
+        if hasattr(self.proprio_encoder, 'parameters'):
+            device = next(self.proprio_encoder.parameters()).device
+            proprio = proprio.to(device)
+            
         proprio = self.proprio_encoder(proprio)
         return proprio
 
     def encode_obs(self, obs):
         """
-        input : obs (dict): "visual", "proprio" (b, t, 3, img_size, img_size)
+        input : obs (dict): "visual", "proprio" (b, t, h, w, c) or (b, t, 3, img_size, img_size)
         output:   z (dict): "visual", "proprio" (b, t, num_patches, encoder_emb_dim)
         """
         visual = obs['visual']
         b = visual.shape[0]
-        visual = rearrange(visual, "b t ... -> (b t) ...")
+        
+        # Convert to torch tensor if it's numpy array and move to correct device
+        if isinstance(visual, torch.Tensor):
+            pass  # already tensor
+        else:
+            visual = torch.tensor(visual)
+        
+        # Ensure visual is on the same device as the model
+        if hasattr(self.encoder, 'parameters'):
+            device = next(self.encoder.parameters()).device
+            visual = visual.to(device)
+        
+        # Handle different input formats
+        if len(visual.shape) == 5:
+            if visual.shape[2] == 3:  # (b, t, 3, h, w) - standard format
+                visual = rearrange(visual, "b t c h w -> (b t) c h w")
+            else:  # (b, t, h, w, c) - point_maze format
+                visual = rearrange(visual, "b t h w c -> (b t) c h w")
+        else:
+            visual = rearrange(visual, "b t ... -> (b t) ...")
+        
+        # Convert to float and normalize to [0, 1] if needed
+        if visual.dtype == torch.uint8:
+            visual = visual.float() / 255.0
+            
         visual = self.encoder_transform(visual)
         visual_embs = self.encoder.forward(visual)
         visual_embs = rearrange(visual_embs, "(b t) p d -> b t p d", b=b)
@@ -204,11 +250,31 @@ class VWorldModel(nn.Module):
         z_src = z[:, : self.num_hist, :, :]  # (b, num_hist, num_patches, dim)
         z_tgt = z[:, self.num_pred :, :, :]  # (b, num_hist, num_patches, dim)
         visual_src = obs['visual'][:, : self.num_hist, ...]  # (b, num_hist, 3, img_size, img_size)
-        visual_tgt = obs['visual'][:, self.num_pred :, ...]  # (b, num_hist, 3, img_size, img_size)
+        
+        # For prediction target, use the frames after num_hist
+        # If we don't have enough frames, repeat the last frame
+        total_frames = obs['visual'].shape[1]
+        if total_frames > self.num_hist:
+            visual_tgt = obs['visual'][:, self.num_hist:, ...]  # Use frames after history
+        else:
+            # Not enough frames, use the last available frame
+            visual_tgt = obs['visual'][:, -1:, ...]  # (b, 1, ...)
+        
+        # Handle different visual formats - convert to standard [B, T, C, H, W] if needed
+        if len(visual_tgt.shape) == 5 and visual_tgt.shape[2] != 3:  # [B, T, H, W, C] format
+            visual_tgt = rearrange(visual_tgt, "b t h w c -> b t c h w")
+        
+        # Ensure visual_tgt is on the same device as the model
+        if hasattr(self.predictor, 'parameters'):
+            device = next(self.predictor.parameters()).device
+            if not isinstance(visual_tgt, torch.Tensor):
+                visual_tgt = torch.tensor(visual_tgt)
+            visual_tgt = visual_tgt.to(device)
 
         if self.predictor is not None:
             z_pred = self.predict(z_src)
-            if self.decoder is not None:
+            # Skip decoder during planning to avoid visual_tgt issues
+            if self.decoder is not None and self.training:
                 obs_pred, diff_pred = self.decode(
                     z_pred.detach()
                 )  # recon loss should only affect decoder
@@ -250,12 +316,25 @@ class VWorldModel(nn.Module):
             visual_pred = None
             z_pred = None
 
-        if self.decoder is not None:
+        if self.decoder is not None and self.training:
             obs_reconstructed, diff_reconstructed = self.decode(
                 z.detach()
             )  # recon loss should only affect decoder
             visual_reconstructed = obs_reconstructed["visual"]
-            recon_loss_reconstructed = self.decoder_criterion(visual_reconstructed, obs['visual'])
+            
+            # Handle different visual formats for target
+            visual_target = obs['visual']
+            if len(visual_target.shape) == 5 and visual_target.shape[2] != 3:  # [B, T, H, W, C] format
+                visual_target = rearrange(visual_target, "b t h w c -> b t c h w")
+            
+            # Ensure visual_target is on the same device as the model
+            if hasattr(self.decoder, 'parameters'):
+                device = next(self.decoder.parameters()).device
+                if not isinstance(visual_target, torch.Tensor):
+                    visual_target = torch.tensor(visual_target)
+                visual_target = visual_target.to(device)
+                
+            recon_loss_reconstructed = self.decoder_criterion(visual_reconstructed, visual_target)
             decoder_loss_reconstructed = (
                 recon_loss_reconstructed
                 + self.decoder_latent_loss_weight * diff_reconstructed
