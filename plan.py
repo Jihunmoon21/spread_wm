@@ -111,6 +111,7 @@ def build_plan_cfg_dicts(
         cfg_dicts.append(cfg_dict)
     return cfg_dicts
 
+# PlanWorkspace 클래스의 __init__ 메서드 (수정 완료된 버전)
 
 class PlanWorkspace:
     def __init__(
@@ -123,6 +124,7 @@ class PlanWorkspace:
         frameskip: int,
         wandb_run: wandb.run,
     ):
+        # --- 1. 기본 속성 초기화 ---
         self.cfg_dict = cfg_dict
         self.wm = wm
         self.dset = dset
@@ -131,10 +133,7 @@ class PlanWorkspace:
         self.frameskip = frameskip
         self.wandb_run = wandb_run
         self.device = next(wm.parameters()).device
-
-        # have different seeds for each planning instances
         self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
-        print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
         self.goal_H = cfg_dict["goal_H"]
@@ -160,6 +159,31 @@ class PlanWorkspace:
         else:
             self.prepare_targets()
 
+        # --- 2. LoRA 학습 관련 설정 및 객체 생성 ---
+        self.lora_optimizer = None
+        self.loss_fn = None
+        self.is_lora_enabled = cfg_dict.get("lora", {}).get("enabled", False)
+        self.is_online_lora = cfg_dict.get("lora", {}).get("online", False)
+
+        if self.is_lora_enabled:
+            print(f"INFO: LoRA training enabled (online: {self.is_online_lora}). Creating optimizer.")
+            params_to_train = filter(lambda p: p.requires_grad, self.wm.predictor.parameters())
+            params = [p for p in self.wm.predictor.parameters() if p.requires_grad]
+            assert len(params) > 0, "No trainable LoRA params; check wrapper init."
+            self.lora_optimizer = torch.optim.Adam(params_to_train, lr=cfg_dict.get("lora", {}).get("lr", 1e-4))
+            self.loss_fn = torch.nn.MSELoss()
+
+            if self.is_online_lora:
+                print("INFO: Initializing variables for Online LoRA loss detection.")
+                self.loss_window = []
+                self.loss_window_length = cfg_dict.get("lora", {}).get("loss_window_length", 5)
+                self.mean_threshold = cfg_dict.get("lora", {}).get("loss_window_mean_threshold", 5.6)
+                self.variance_threshold = cfg_dict.get("lora", {}).get("loss_window_variance_threshold", 0.08)
+                self.last_loss_window_mean = float('inf')
+                self.last_loss_window_variance = float('inf')
+                self.new_peak_detected = True
+
+        # --- 3. 완전한 정보로 Evaluator를 단 한 번만 생성 ---
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
             obs_g=self.obs_g,
@@ -171,34 +195,37 @@ class PlanWorkspace:
             seed=self.eval_seed,
             preprocessor=self.data_preprocessor,
             n_plot_samples=self.cfg_dict["n_plot_samples"],
+            # LoRA 관련 인자들을 여기서 전달
+            is_lora_enabled=self.is_lora_enabled,
+            is_online_lora=self.is_online_lora,
+            workspace=self
         )
 
-        if self.wandb_run is None or isinstance(
-            self.wandb_run, wandb.sdk.lib.disabled.RunDisabled
-        ):
+        # --- 4. 완성된 Evaluator를 사용하여 Planner 생성 ---
+        if self.wandb_run is None or isinstance(self.wandb_run, wandb.sdk.lib.disabled.RunDisabled):
             self.wandb_run = DummyWandbRun()
 
-        self.log_filename = "logs.json"  # planner and final eval logs are dumped here
+        self.log_filename = "logs.json"
         self.planner = hydra.utils.instantiate(
             self.cfg_dict["planner"],
             wm=self.wm,
-            env=self.env,  # only for mpc
+            env=self.env,
             action_dim=self.action_dim,
             objective_fn=objective_fn,
             preprocessor=self.data_preprocessor,
-            evaluator=self.evaluator,
+            evaluator=self.evaluator, # <- 이제 올바른 evaluator가 전달됩니다.
             wandb_run=self.wandb_run,
             log_filename=self.log_filename,
         )
 
-        # optional: assume planning horizon equals to goal horizon
+        # --- 5. 나머지 초기화 ---
         from planning.mpc import MPCPlanner
         if isinstance(self.planner, MPCPlanner):
             self.planner.sub_planner.horizon = cfg_dict["goal_H"]
             self.planner.n_taken_actions = cfg_dict["goal_H"]
         else:
             self.planner.horizon = cfg_dict["goal_H"]
-
+            
         self.dump_targets()
 
     def prepare_targets(self):
@@ -546,6 +573,12 @@ def planning_main(cfg_dict):
     with open(os.path.join(model_path, "hydra.yaml"), "r") as f:
         model_cfg = OmegaConf.load(f)
 
+    # plan cfg에 lora 섹션이 없다면 model cfg에서 가져와 주입
+    if "lora" not in cfg_dict or cfg_dict.get("lora") is None:
+        if OmegaConf.select(model_cfg, "lora") is not None:
+            cfg_dict["lora"] = OmegaConf.to_container(model_cfg.lora, resolve=True)
+            print(f"Loaded lora config from model cfg: {cfg_dict['lora']}")
+
     seed(cfg_dict["seed"])
     _, dset = hydra.utils.call(
         model_cfg.env.dataset,
@@ -560,6 +593,15 @@ def planning_main(cfg_dict):
         Path(model_path) / "checkpoints" / f"model_{cfg_dict['model_epoch']}.pth"
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
+
+    # LoRA wrapper check
+    try:
+        predictor_obj = getattr(model, "predictor", None)
+        is_lora_wrapped = isinstance(predictor_obj, LoRA_ViT_spread)
+        pred_type = type(predictor_obj).__name__ if predictor_obj is not None else "None"
+        print(f"[LoRA Check] predictor wrapped: {is_lora_wrapped} (type={pred_type})")
+    except Exception as e:
+        print(f"[LoRA Check] error: {e}")
 
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":

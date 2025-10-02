@@ -45,3 +45,6 @@ lora:
   enabled: false # LoRA 자체를 사용할지 여부
   online: false   # LoRA 사용 시, 온라인 모드를 쓸지 여부 (false면 일반 LoRA)
   rank: 4        # LoRA의 rank
+  lr: 1e-4
+  steps: 100              # planning 시작 전에 적응 스텝 수
+  update_every_steps: 0   # online=true일 때만 사용 (0이면 비활성)

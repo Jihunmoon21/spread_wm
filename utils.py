@@ -5,8 +5,10 @@ import argparse
 import numpy as np
 from PIL import Image
 from omegaconf import OmegaConf
-from typing import Callable, Dict
+from typing import Callable, Dict, List, Tuple, Any, Sequence, Union, Optional
 import psutil
+from collections import deque
+import copy
 
 def get_ram_usage():
     process = psutil.Process(os.getpid())
@@ -43,6 +45,33 @@ def concat_trajdict(dcts):
         else:
             raise TypeError(f"Unsupported data type: {type(dcts[0][k])}")
     return full_dct
+
+ArrayLike = Union[np.ndarray, torch.Tensor]
+TrajDict = Dict[str, ArrayLike]
+
+def stack_trajdict(dcts: List[TrajDict], axis: int = 1) -> TrajDict:
+    """
+    여러 시점(또는 블록)을 새 시간축처럼 쌓기.
+    - 값이 [B, ...]이면 stack으로 새 축 생성 → [B, L, ...]
+    - 값이 [B, K, ...]이면 concat으로 이어붙임 → [B, K_total, ...]
+    """
+    assert len(dcts) > 0, "Empty dcts"
+    _ensure_same_keys(dcts)
+    out: TrajDict = {}
+    for k in dcts[0].keys():
+        arrs = [d[k] for d in dcts]
+        a0 = arrs[0]
+        if a0.ndim == 2:  # [B, D] 같은 경우
+            if _is_torch(a0):
+                out[k] = torch.stack(arrs, dim=axis)
+            else:
+                out[k] = np.stack(arrs, axis=axis)
+        else:
+            if _is_torch(a0):
+                out[k] = torch.cat(arrs, dim=axis)
+            else:
+                out[k] = np.concatenate(arrs, axis=axis)
+    return out
 
 def aggregate_dct(dcts):
     full_dct = {}
