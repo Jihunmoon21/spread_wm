@@ -75,20 +75,11 @@ class MPCPlanner(BasePlanner):
         Returns:
             actions: (B, T, action_dim) torch.Tensor
         """
-        # MPC 상태 리셋 (핵심 수정!)
-        self.iter = 0
-        self.planned_actions = []
-        
-        print(f"[MPC RESET] Resetting MPC state - iter: {self.iter}, max_iter: {self.max_iter}")
-        
+
         n_evals = obs_0["visual"].shape[0]
         self.is_success = np.zeros(n_evals, dtype=bool)
         self.action_len = np.full(n_evals, np.inf)
         init_obs_0, init_state_0 = self.evaluator.get_init_cond()
-        
-        print(f"[MPC START] n_evals: {n_evals}, is_success: {self.is_success}")
-        print(f"[MPC START] Loop condition check: not np.all({self.is_success}) = {not np.all(self.is_success)}, {self.iter} < {self.max_iter} = {self.iter < self.max_iter}")
-        print(f"[MPC START] Will enter loop: {not np.all(self.is_success) and self.iter < self.max_iter}")
 
         cur_obs_0 = obs_0
         memo_actions = None

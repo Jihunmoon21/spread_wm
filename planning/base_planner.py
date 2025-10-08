@@ -26,27 +26,17 @@ class BasePlanner(ABC):
         self.log_filename = log_filename  # do not log if None
 
     def dump_logs(self, logs):
-        def convert_to_json_serializable(obj):
-            if isinstance(obj, np.ndarray):
-                return obj.tolist()  # ndarray를 리스트로 변환
-            elif isinstance(obj, (np.float32, np.int32, np.int64, np.float64)):
-                return obj.item()
-            elif isinstance(obj, (np.bool_, bool)):
-                return bool(obj)
-            else:
-                return obj
-        
         logs_entry = {
-            key: convert_to_json_serializable(value)
+            key: (
+                value.item()
+                if isinstance(value, (np.float32, np.int32, np.int64))
+                else value
+            )
             for key, value in logs.items()
         }
-        
         if self.log_filename is not None:
-            try:
-                with open(self.log_filename, "a") as file:
-                    file.write(json.dumps(logs_entry) + "\n")
-            except (TypeError, ValueError) as e:
-                print(f"[WARNING] Failed to log to file: {e}")
+            with open(self.log_filename, "a") as file:
+                file.write(json.dumps(logs_entry) + "\n")
 
     @abstractmethod
     def plan(self):
