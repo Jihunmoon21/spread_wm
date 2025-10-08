@@ -14,7 +14,6 @@ from itertools import product
 from pathlib import Path
 from einops import rearrange
 from omegaconf import OmegaConf, open_dict
-from collections import OrderedDict
 
 from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
@@ -133,11 +132,13 @@ class PlanWorkspace:
         self.frameskip = frameskip
         self.wandb_run = wandb_run
         self.device = next(wm.parameters()).device
+        
         self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
+        print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
         self.goal_H = cfg_dict["goal_H"]
-        self.action_dim = self.dset.action_dim
+        self.action_dim = self.dset.action_dim * self.frameskip
         self.debug_dset_init = cfg_dict["debug_dset_init"]
 
         objective_fn = hydra.utils.call(
@@ -159,7 +160,7 @@ class PlanWorkspace:
         else:
             self.prepare_targets()
 
-        # --- 2. LoRA 학습 관련 설정 및 객체 생성 ---
+        # --- LoRA 학습 관련 설정 및 객체 생성 ---
         self.lora_optimizer = None
         self.loss_fn = None
         self.is_lora_enabled = cfg_dict.get("lora", {}).get("enabled", False)
@@ -201,7 +202,6 @@ class PlanWorkspace:
                 self.last_loss_window_variance = float('inf')
                 self.new_peak_detected = True
 
-        # --- 3. 완전한 정보로 Evaluator를 단 한 번만 생성 ---
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
             obs_g=self.obs_g,
@@ -219,24 +219,25 @@ class PlanWorkspace:
             workspace=self
         )
 
-        # --- 4. 완성된 Evaluator를 사용하여 Planner 생성 ---
-        if self.wandb_run is None or isinstance(self.wandb_run, wandb.sdk.lib.disabled.RunDisabled):
+        if self.wandb_run is None or isinstance(
+            self.wandb_run, wandb.sdk.lib.disabled.RunDisabled
+        ):
             self.wandb_run = DummyWandbRun()
 
-        self.log_filename = "logs.json"
+        self.log_filename = "logs.json"  # planner and final eval logs are dumped here
         self.planner = hydra.utils.instantiate(
             self.cfg_dict["planner"],
             wm=self.wm,
-            env=self.env,
-            action_dim=self.action_dim * self.frameskip,  # planner는 frameskip이 적용된 action_dim 필요
+            env=self.env,  # only for mpc
+            action_dim=self.action_dim,
             objective_fn=objective_fn,
             preprocessor=self.data_preprocessor,
-            evaluator=self.evaluator, # <- 이제 올바른 evaluator가 전달됩니다.
+            evaluator=self.evaluator,
             wandb_run=self.wandb_run,
             log_filename=self.log_filename,
         )
 
-        # --- 5. 나머지 초기화 ---
+        # optional: assume planning horizon equals to goal horizon
         from planning.mpc import MPCPlanner
         if isinstance(self.planner, MPCPlanner):
             self.planner.sub_planner.horizon = cfg_dict["goal_H"]
@@ -376,38 +377,16 @@ class PlanWorkspace:
             actions_init = self.gt_actions
         else:
             actions_init = None
-            
-        print(f"[PLAN.PY] Starting planning with planner type: {type(self.planner).__name__}")
-        print(f"[PLAN.PY] obs_0 shape: {self.obs_0['visual'].shape}")
-        print(f"[PLAN.PY] obs_g shape: {self.obs_g['visual'].shape}")
-        
         actions, action_len = self.planner.plan(
             obs_0=self.obs_0,
             obs_g=self.obs_g,
             actions=actions_init,
         )
-        
-        print(f"[PLAN.PY] Planning completed. Actions shape: {actions.shape}")
-        print(f"[PLAN.PY] Action length: {action_len}")
         logs, successes, _, _ = self.evaluator.eval_actions(
             actions.detach(), action_len, save_video=True, filename="output_final"
         )
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)
-        
-        # 최종 결과 요약 출력
-        if 'final_eval/success' in logs:
-            final_success_rate = np.mean(logs['final_eval/success'])
-            final_avg_dist = np.mean(logs['final_eval/state_dist'])
-            print(f"\n{'='*60}")
-            print(f"FINAL PLANNING SUMMARY")
-            print(f"{'='*60}")
-            print(f"Success Rate: {final_success_rate:.2%}")
-            print(f"Average Distance to Goal: {final_avg_dist:.4f}")
-            print(f"Total Evaluations: {len(logs['final_eval/success'])}")
-            print(f"Successful Plans: {np.sum(logs['final_eval/success'])}")
-            print(f"{'='*60}\n")
-        
         logs_entry = {
             key: (
                 value.item()
@@ -434,150 +413,51 @@ def load_ckpt(snapshot_path, device):
     return result
 
 def load_model(model_ckpt, train_cfg, num_action_repeat, device):
-    # 1. 체크포인트 파일(.pth)을 불러옵니다.
-    if not model_ckpt.exists():
-        raise FileNotFoundError(f"Model checkpoint not found at {model_ckpt}")
-    print(f"Loading checkpoint from: {model_ckpt}")
-    payload = torch.load(model_ckpt, map_location=device, weights_only=False)
-    print(f"Resumed from epoch {payload.get('epoch', 'N/A')}")
+    result = {}
+    if model_ckpt.exists():
+        result = load_ckpt(model_ckpt, device)
+        print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
 
-    # 2. payload에서 사전 학습된 모델 객체들을 직접 추출합니다.
-    encoder = payload.get("encoder")
-    base_predictor = payload.get("predictor")
-    decoder = payload.get("decoder")
-    proprio_encoder = payload.get("proprio_encoder")
-    action_encoder = payload.get("action_encoder")
+    if "encoder" not in result:
+        result["encoder"] = hydra.utils.instantiate(
+            train_cfg.encoder,
+        )
+    if "predictor" not in result:
+        raise ValueError("Predictor not found in model checkpoint")
 
-    if base_predictor is None:
-        raise ValueError("Predictor not found in the loaded checkpoint payload.")
-    if encoder is None:
-        encoder = hydra.utils.instantiate(train_cfg.encoder)
+    if train_cfg.has_decoder and "decoder" not in result:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        if train_cfg.env.decoder_path is not None:
+            decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
+            ckpt = torch.load(decoder_path)
+            if isinstance(ckpt, dict):
+                result["decoder"] = ckpt["decoder"]
+            else:
+                result["decoder"] = torch.load(decoder_path)
+        else:
+            raise ValueError(
+                "Decoder path not found in model checkpoint \
+                                and is not provided in config"
+            )
+    elif not train_cfg.has_decoder:
+        result["decoder"] = None
 
-    def oc_get(cfg, key, default=None):
-        val = OmegaConf.select(cfg, key)  # 없으면 None 반환
-        return default if val is None else val
-
-    def to_bool(v):
-        if isinstance(v, bool): return v
-        if isinstance(v, str):  return v.strip().lower() in ("1","true","yes","on")
-        return bool(v) 
-    # OmegaConf.select로 존재 여부 확인 후 인스턴스화
-    if proprio_encoder is None and OmegaConf.select(train_cfg, "proprio_encoder") is not None:
-        proprio_encoder = hydra.utils.instantiate(train_cfg.proprio_encoder)
-
-    if action_encoder is None and OmegaConf.select(train_cfg, "action_encoder") is not None:
-        action_encoder = hydra.utils.instantiate(train_cfg.action_encoder)
-
-    # 3) LoRA 주입 여부 결정 (안전 가드 포함)
-    raw_flag  = oc_get(train_cfg, "lora.enabled", False)
-    use_lora  = to_bool(raw_flag)
-    rank      = oc_get(train_cfg, "lora.rank", 4)
-    online    = to_bool(oc_get(train_cfg, "lora.online", False))
-
-    # use_lora=False인데 이미 래핑되어 들어온 경우 강제 해제
-    if not use_lora and isinstance(base_predictor, LoRA_ViT_spread):
-        print("[LoRA] unwrap enforced (use_lora=False)")
-        base_predictor = base_predictor.lora_vit
-
-    # 이번 로더에서 주입(중복 방지)
-    if use_lora and isinstance(base_predictor, ViTPredictor) and not isinstance(base_predictor, LoRA_ViT_spread):
-        predictor = LoRA_ViT_spread(vit_model=base_predictor, r=rank, online_mode=online)
-        print(f"LoRA is enabled for the Predictor. rank={rank}, online={online}")
-    else:
-        predictor = base_predictor
-        print("LoRA is disabled.")
-
-    # (선택) 안전 확인: LoRA 비활성 시 래퍼가 남아있지 않도록
-    if not use_lora:
-        assert not isinstance(predictor, LoRA_ViT_spread), "LoRA wrapper present despite lora.enabled=False"
-
-    # 4. 전체 World Model을 조립합니다.
     model = hydra.utils.instantiate(
         train_cfg.model,
-        encoder=encoder,
-        proprio_encoder=proprio_encoder,
-        action_encoder=action_encoder,
-        predictor=predictor,
-        decoder=decoder,
+        encoder=result["encoder"],
+        proprio_encoder=result["proprio_encoder"],
+        action_encoder=result["action_encoder"],
+        predictor=result["predictor"],
+        decoder=result["decoder"],
         proprio_dim=train_cfg.proprio_emb_dim,
         action_dim=train_cfg.action_emb_dim,
         concat_dim=train_cfg.concat_dim,
         num_action_repeat=num_action_repeat,
         num_proprio_repeat=train_cfg.num_proprio_repeat,
     )
-    
-    # 5. 디코더를 별도 파일에서 불러와야 하는 경우의 처리
-    if train_cfg.has_decoder and decoder is None and train_cfg.env.get('decoder_path') is not None:
-        print("Loading decoder from separate path...")
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-        ckpt = torch.load(decoder_path, map_location=device, weights_only=False)
-        model.decoder = ckpt.get("decoder", ckpt) if isinstance(ckpt, dict) else ckpt
-            
     model.to(device)
-    model.eval() # 모델을 평가 모드로 설정
     return model
 
-# def load_model(model_ckpt, train_cfg, num_action_repeat, device):
-#     result = {}
-#     if model_ckpt.exists():
-#         result = load_ckpt(model_ckpt, device)
-#         print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
-
-#     if "encoder" not in result:
-#         result["encoder"] = hydra.utils.instantiate(
-#             train_cfg.encoder,
-#         )
-#     if "predictor" not in result:
-#         raise ValueError("Predictor not found in model checkpoint")
-
-#     # # LoRA 주입
-#     # predictor = result["predictor"]
-#     # if getattr(train_cfg, "lora_enable", True) and isinstance(predictor, ViTPredictor):
-#     #     predictor = LoRA_ViT_spread(
-#     #         predictor,
-#     #         r=getattr(train_cfg, "lora_rank", 4),
-#     #         online_mode=getattr(train_cfg, "lora_online", True),
-#     #     ).to(device)
-#     # if isinstance(predictor, ViTPredictor):
-#     #     # 필요 시 r 값/online_mode는 cfg에서 받도록 하세요.
-#     #     predictor = LoRA_ViT_spread(predictor, r=getattr(train_cfg, "lora_rank", 4),
-#     #                                 online_mode=getattr(train_cfg, "lora_online", True))
-#     #     predictor = predictor.to(device)
-#     # result["predictor"] = predictor
-
-#     if train_cfg.has_decoder and "decoder" not in result:
-#         base_path = os.path.dirname(os.path.abspath(__file__))
-#         if train_cfg.env.decoder_path is not None:
-#             decoder_path = os.path.join(base_path, train_cfg.env.decoder_path)
-#             ckpt = torch.load(decoder_path)
-#             if isinstance(ckpt, dict):
-#                 result["decoder"] = ckpt["decoder"]
-#             else:
-#                 result["decoder"] = torch.load(decoder_path)
-#         else:
-#             raise ValueError(
-#                 "Decoder path not found in model checkpoint \
-#                                 and is not provided in config"
-#             )
-#     elif not train_cfg.has_decoder:
-#         result["decoder"] = None
-
-#     model = hydra.utils.instantiate(
-#         train_cfg.model,
-#         encoder=result["encoder"],
-#         proprio_encoder=result["proprio_encoder"],
-#         action_encoder=result["action_encoder"],
-#         predictor=result["predictor"],
-#         decoder=result["decoder"],
-#         proprio_dim=train_cfg.proprio_emb_dim,
-#         action_dim=train_cfg.action_emb_dim,
-#         concat_dim=train_cfg.concat_dim,
-#         num_action_repeat=num_action_repeat,
-#         num_proprio_repeat=train_cfg.num_proprio_repeat,
-#     )
-#     model.to(device)
-#     return model
 
 
 class DummyWandbRun:
@@ -613,12 +493,6 @@ def planning_main(cfg_dict):
     with open(os.path.join(model_path, "hydra.yaml"), "r") as f:
         model_cfg = OmegaConf.load(f)
 
-    # plan cfg에 lora 섹션이 없다면 model cfg에서 가져와 주입
-    if "lora" not in cfg_dict or cfg_dict.get("lora") is None:
-        if OmegaConf.select(model_cfg, "lora") is not None:
-            cfg_dict["lora"] = OmegaConf.to_container(model_cfg.lora, resolve=True)
-            print(f"Loaded lora config from model cfg: {cfg_dict['lora']}")
-
     seed(cfg_dict["seed"])
     _, dset = hydra.utils.call(
         model_cfg.env.dataset,
@@ -634,25 +508,26 @@ def planning_main(cfg_dict):
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
-    # LoRA wrapper check
-    try:
-        predictor_obj = getattr(model, "predictor", None)
-        is_lora_wrapped = isinstance(predictor_obj, LoRA_ViT_spread)
-        pred_type = type(predictor_obj).__name__ if predictor_obj is not None else "None"
-        print(f"[LoRA Check] predictor wrapped: {is_lora_wrapped} (type={pred_type})")
-    except Exception as e:
-        print(f"[LoRA Check] error: {e}")
-
-    # Use SerialVectorEnv to avoid multiprocessing EOFError issues
-    from env.serial_vector_env import SerialVectorEnv
-    env = SerialVectorEnv(
-        [
-            gym.make(
-                model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
-            )
-            for _ in range(cfg_dict["n_evals"])
-        ]
-    )
+    # use dummy vector env for wall and deformable envs
+    if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
+        from env.serial_vector_env import SerialVectorEnv
+        env = SerialVectorEnv(
+            [
+                gym.make(
+                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                )
+                for _ in range(cfg_dict["n_evals"])
+            ]
+        )
+    else:
+        env = SubprocVectorEnv(
+            [
+                lambda: gym.make(
+                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                )
+                for _ in range(cfg_dict["n_evals"])
+            ]
+        )
 
     plan_workspace = PlanWorkspace(
         cfg_dict=cfg_dict,

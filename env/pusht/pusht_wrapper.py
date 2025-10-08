@@ -86,10 +86,7 @@ class PushTWrapper(PushTEnv):
         
         # 전체 상태 거리 계산 (안전한 차원으로)
         state_dist = np.linalg.norm(goal_state_safe - cur_state_safe)
-        
-        print(f"[PUSHT EVAL] goal_dim: {len(goal_state)}, cur_dim: {len(cur_state)}, min_dim: {min_dim}")
-        print(f"[PUSHT EVAL] pos_diff: {pos_diff:.2f}, success: {success}, state_dist: {state_dist:.2f}")
-        
+
         return {
             'success': success,
             'state_dist': state_dist,
