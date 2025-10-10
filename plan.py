@@ -20,9 +20,11 @@ from custom_resolvers import replace_slash
 from preprocessor import Preprocessor
 from planning.evaluator import PlanEvaluator
 from utils import cfg_to_dict, seed
+from collections import deque
 
 from models.vit import ViTPredictor
 from models.lora import LoRA_ViT_spread
+from planning.online import OnlineLora
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -165,6 +167,9 @@ class PlanWorkspace:
         self.loss_fn = None
         self.is_lora_enabled = cfg_dict.get("lora", {}).get("enabled", False)
         self.is_online_lora = cfg_dict.get("lora", {}).get("online", False)
+        # 시각과 proprioceptive 손실 가중치 설정
+        self.visual_loss_weight = cfg_dict.get("lora", {}).get("visual_loss_weight", 1.0)
+        self.proprio_loss_weight = cfg_dict.get("lora", {}).get("proprio_loss_weight", 0.5)
 
         if self.is_lora_enabled:
             print(f"INFO: LoRA training enabled (online: {self.is_online_lora}). Creating optimizer.")

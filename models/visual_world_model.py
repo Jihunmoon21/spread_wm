@@ -33,7 +33,7 @@ class VWorldModel(nn.Module):
         self.action_encoder = action_encoder
         self.decoder = decoder  # decoder could be None
         # self.predictor = predictor  # predictor could be None
-        self.predictor = LoRA_ViT_spread(vit_model=predictor, r=4)
+        self.predictor = LoRA_ViT_spread(vit_model=predictor, r=8)
         self.train_encoder = train_encoder
         self.train_predictor = train_predictor
         self.train_decoder = train_decoder

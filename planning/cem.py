@@ -85,6 +85,7 @@ class CEMPlanner(BasePlanner):
         n_evals = mu.shape[0]
 
         for i in range(self.opt_steps):
+            print(f"CEM Step {i+1}/{self.opt_steps}")
             # optimize individual instances
             losses = []
             for traj in range(n_evals):
