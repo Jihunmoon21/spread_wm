@@ -68,6 +68,10 @@ class CEMPlanner(BasePlanner):
         Returns:
             actions: (B, T, action_dim) torch.Tensor, T <= self.horizon
         """
+        # Evaluator에서 LoRA 파라미터 변화량 추적을 위한 변수 초기화
+        if hasattr(self.evaluator, '_prev_lora_params'):
+            self.evaluator._prev_lora_params = None
+
         trans_obs_0 = move_to_device(
             self.preprocessor.transform_obs(obs_0), self.device
         )
