@@ -144,7 +144,7 @@ class LoRA_ViT_spread(nn.Module):
 
         self.lora_vit = vit_model
         self.reset_parameters()
-        self.lora_vit.pos_embedding.requires_grad = True
+        self.lora_vit.pos_embedding.requires_grad = False
         self._assert_equivalence_once()
     @property
     def pos_embedding(self):
