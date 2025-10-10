@@ -48,3 +48,13 @@ lora:
   lr: 5e-4
   steps: 100              # planning 시작 전에 적응 스텝 수
   update_every_steps: 0   # online=true일 때만 사용 (0이면 비활성)
+  
+  # LoRA 적층 관련 설정 (online=true일 때만 사용)
+  loss_window_length: 5                    # Loss window 크기
+  loss_window_mean_threshold: 0.01          # Loss 평균 임계값
+  loss_window_variance_threshold: 1e-5      # Loss 분산 임계값
+  min_steps_for_stack: 50                   # 최소 스텝 수 (적층 간격)
+  
+  # Loss 가중치 (설정 파일에 없는 경우 기본값 사용)
+  visual_loss_weight: 1.0
+  proprio_loss_weight: 0.3

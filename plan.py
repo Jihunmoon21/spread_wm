@@ -112,8 +112,7 @@ def build_plan_cfg_dicts(
         cfg_dicts.append(cfg_dict)
     return cfg_dicts
 
-# PlanWorkspace 클래스의 __init__ 메서드 (수정 완료된 버전)
-
+# PlanWorkspace 클래스의 __init__ 메서드 
 class PlanWorkspace:
     def __init__(
         self,
@@ -163,49 +162,13 @@ class PlanWorkspace:
             self.prepare_targets()
 
         # --- LoRA 학습 관련 설정 및 객체 생성 ---
-        self.lora_optimizer = None
-        self.loss_fn = None
-        self.is_lora_enabled = cfg_dict.get("lora", {}).get("enabled", False)
-        self.is_online_lora = cfg_dict.get("lora", {}).get("online", False)
-        # 시각과 proprioceptive 손실 가중치 설정
-        self.visual_loss_weight = cfg_dict.get("lora", {}).get("visual_loss_weight", 1.0)
-        self.proprio_loss_weight = cfg_dict.get("lora", {}).get("proprio_loss_weight", 0.5)
+        self.online_learner = None # OnlineLora 객체를 담을 변수
+        self.is_lora_enabled = self.cfg_dict.get("lora", {}).get("enabled", False)
 
         if self.is_lora_enabled:
-            print(f"INFO: LoRA training enabled (online: {self.is_online_lora}). Creating optimizer.")
-            
-            # LoRA 학습 시 다른 모든 컴포넌트 동결
-            print("INFO: Freezing all non-LoRA parameters...")
-            for param in self.wm.encoder.parameters():
-                param.requires_grad = False
-            for param in self.wm.proprio_encoder.parameters():
-                param.requires_grad = False
-            for param in self.wm.action_encoder.parameters():
-                param.requires_grad = False
-            if self.wm.decoder is not None:
-                for param in self.wm.decoder.parameters():
-                    param.requires_grad = False
-            
-            # LoRA 파라미터만 학습하도록 필터링
-            params_to_train = [p for p in self.wm.parameters() if p.requires_grad]
-            total_trainable_params = sum(p.numel() for p in params_to_train)
-            total_model_params = sum(p.numel() for p in self.wm.parameters())
-            lora_ratio = (total_trainable_params / total_model_params) * 100 if total_model_params > 0 else 0
-            print(f"INFO: Found {len(params_to_train)} trainable parameter tensors ({total_trainable_params:,} parameters) for LoRA.")
-            print(f"INFO: LoRA parameters: {total_trainable_params:,} / Total model parameters: {total_model_params:,} ({lora_ratio:.4f}%)")
-            assert len(params_to_train) > 0, "No trainable LoRA params; check wrapper init."
-            self.lora_optimizer = torch.optim.Adam(params_to_train, lr=cfg_dict.get("lora", {}).get("lr", 1e-4))
-            self.loss_fn = torch.nn.MSELoss()
-
-            if self.is_online_lora:
-                print("INFO: Initializing variables for Online LoRA loss detection.")
-                self.loss_window = []
-                self.loss_window_length = cfg_dict.get("lora", {}).get("loss_window_length", 5)
-                self.mean_threshold = cfg_dict.get("lora", {}).get("loss_window_mean_threshold", 5.6)
-                self.variance_threshold = cfg_dict.get("lora", {}).get("loss_window_variance_threshold", 0.08)
-                self.last_loss_window_mean = float('inf')
-                self.last_loss_window_variance = float('inf')
-                self.new_peak_detected = True
+            print("INFO: LoRA training enabled. Initializing OnlineLora module.")
+            # OnlineLora 객체를 생성하고, workspace 전체를 넘겨 Evaluator에서 접근할 수 있도록
+            self.online_learner = OnlineLora(workspace=self)
 
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
@@ -218,10 +181,8 @@ class PlanWorkspace:
             seed=self.eval_seed,
             preprocessor=self.data_preprocessor,
             n_plot_samples=self.cfg_dict["n_plot_samples"],
-            # LoRA 관련 인자들을 여기서 전달
+            workspace=self, # workspace를 evaluator에 전달하는 것은 그대로 유지
             is_lora_enabled=self.is_lora_enabled,
-            is_online_lora=self.is_online_lora,
-            workspace=self
         )
 
         if self.wandb_run is None or isinstance(
