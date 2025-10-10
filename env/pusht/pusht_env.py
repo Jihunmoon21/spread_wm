@@ -601,7 +601,7 @@ class PushTEnv(gym.Env):
             self.clock = pygame.time.Clock()
 
         canvas = pygame.Surface((self.window_size, self.window_size))
-        canvas.fill((0, 0, 0)) # (255, 255, 255)
+        canvas.fill((255, 255, 255)) # (255, 255, 255)
         self.screen = canvas
 
         draw_options = DrawOptions(canvas)

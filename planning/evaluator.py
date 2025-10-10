@@ -54,6 +54,24 @@ class PlanEvaluator:  # evaluator for planning
         # workspace로부터 optimizer와 loss_fn 가져오기
         if self.is_lora_enabled:
             self.lora_optimizer = self.workspace.lora_optimizer
+            print(f"LoRA enabled: {self.is_lora_enabled}, Online LoRA: {self.is_online_lora}")
+            
+            # LoRA 파라미터 상태 확인
+            if hasattr(self.wm, 'predictor') and hasattr(self.wm.predictor, 'lora_vit'):
+                total_params = sum(p.numel() for p in self.wm.parameters())
+                trainable_params = sum(p.numel() for p in self.wm.parameters() if p.requires_grad)
+                print(f"Model parameters - Total: {total_params:,}, Trainable: {trainable_params:,}")
+                
+                # LoRA 파라미터 상세 정보 (수정된 부분)
+                if hasattr(self.wm.predictor, 'wnew_As'):
+                    # 각 레이어(layer) 내부의 파라미터(p)를 순회하도록 수정
+                    lora_params = sum(p.numel() for layer in self.wm.predictor.wnew_As + self.wm.predictor.wnew_Bs for p in layer.parameters())
+                    print(f"LoRA parameters: {lora_params:,}")
+            else:
+                print("Warning: LoRA predictor not found in world model")
+            
+            # LoRA 파라미터 변화량 추적을 위한 변수 초기화
+            self._prev_lora_params = None
 
     def assign_init_cond(self, obs_0, state_0):
         self.obs_0 = obs_0
@@ -126,12 +144,89 @@ class PlanEvaluator:  # evaluator for planning
             actions.cpu(), "b t (f d) -> b (t f) d", f=self.frameskip
         )
         exec_actions = self.preprocessor.denormalize_actions(exec_actions).numpy()
-        # ======================================================= #
-        # 여기에 디버깅 코드를 추가했습니다.
-        print("--- Debugging Actions ---")
-        print(f"Shape of entire action sequence (Batch, Time, Dim): {exec_actions.shape}")
-        # ======================================================= #
+
         e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions)
+        # ======================================================= #
+        if self.is_lora_enabled:
+            print("--- Starting LoRA Online Learning ---")
+            
+            # 1. 예측: 월드 모델을 사용하여 동일한 행동으로 미래를 '예측'합니다.
+            #    (그래디언트 계산이 활성화된 상태에서 실행)
+            print("Step 1: Running world model rollout with gradients enabled...")
+            i_z_obses_pred, _ = self.wm.rollout(
+                obs_0=trans_obs_0,
+                act=actions,
+            )
+
+            # 2. 정답 준비: 실제 환경 결과(e_obses)를 인코딩하여 '정답' 잠재 상태를 만듭니다.
+            print("Step 2: Encoding ground truth observations...")
+            with torch.no_grad():
+                trans_obs_gt = self.preprocessor.transform_obs(e_obses)
+                trans_obs_gt = move_to_device(trans_obs_gt, self.device)
+                i_z_obses_gt = self.wm.encode_obs(trans_obs_gt)
+
+            # 3. 손실 계산: 예측과 정답 사이의 오차(MSE Loss)를 계산합니다.
+            # .detach()를 사용하여 정답값으로부터는 그래디언트가 흐르지 않도록 함)
+            print("Step 3: Computing loss...")
+            # 실제 궤적을 self.frameskip 간격으로 샘플링(slicing)하여 시점을 통일합니다.
+            gt_proprio_resampled = i_z_obses_gt["proprio"][:, ::self.frameskip, :].detach()
+            loss = self.workspace.loss_fn(i_z_obses_pred["proprio"], gt_proprio_resampled)
+            print(f"Loss computed: {loss.item():.6f}")
+
+            # 4. 역전파 및 업데이트: 계산된 손실을 바탕으로 LoRA 가중치를 업데이트합니다.
+            print("Step 4: Backpropagation and parameter update...")
+            self.lora_optimizer.zero_grad()
+            
+            # 그래디언트 계산
+            loss.backward()
+            
+            # 그래디언트 크기 체크
+            total_grad_norm = 0
+            trainable_params = 0
+            for param in self.wm.parameters():
+                if param.requires_grad and param.grad is not None:
+                    total_grad_norm += param.grad.data.norm(2).item() ** 2
+                    trainable_params += 1
+            
+            total_grad_norm = total_grad_norm ** 0.5
+            print(f"Gradient norm: {total_grad_norm:.6f}, Trainable params: {trainable_params}")
+            
+            # 파라미터 업데이트
+            self.lora_optimizer.step()
+            
+            print(f"--- LoRA Online Update Complete ---")
+            
+            # 5. 추가 검증: LoRA 파라미터 변화량 확인
+            if hasattr(self, '_prev_lora_params') and self._prev_lora_params is not None:
+                # 현재 학습 가능한(requires_grad=True) 모든 파라미터를 가져옴
+                current_lora_params = [
+                    p.clone() for p in self.wm.predictor.parameters() if p.requires_grad
+                ]
+                
+                if len(self._prev_lora_params) != len(current_lora_params):
+                    print("Warning: Number of trainable parameters changed. Skipping parameter change check for this step.")
+                
+                else:
+                    param_changes = []
+                    all_shapes_match = True
+                    for prev, curr in zip(self._prev_lora_params, current_lora_params):
+                        if prev.shape != curr.shape:
+                            print(f"Warning: Parameter shape mismatch. Prev: {prev.shape}, Curr: {curr.shape}. Skipping check.")
+                            all_shapes_match = False
+                            break # 모양이 하나라도 다르면 비교 중단
+                        
+                        change = torch.norm(curr - prev).item()
+                        param_changes.append(change)
+
+                    if all_shapes_match and param_changes:
+                        avg_param_change = sum(param_changes) / len(param_changes)
+                        print(f"Average LoRA parameter change: {avg_param_change:.8f}")
+            
+            params_to_save = [
+                p.clone() for p in self.wm.predictor.parameters() if p.requires_grad_
+            ]
+            self._prev_lora_params = params_to_save
+        # ======================================================= #
         e_visuals = e_obses["visual"]
         e_final_obs = self._get_trajdict_last(e_obses, action_len * self.frameskip + 1)
         e_final_state = self._get_traj_last(e_states, action_len * self.frameskip + 1)[
