@@ -52,7 +52,7 @@ class PushTDataset(TrajDataset):
                 shapes = pickle.load(f)
                 self.shapes = shapes
         else:
-            self.shapes = ['T'] * len(self.states)
+            self.shapes = ['I'] * len(self.states)
 
         self.n_rollout = n_rollout
         if self.n_rollout:
@@ -119,7 +119,7 @@ class PushTDataset(TrajDataset):
         if self.transform:
             image = self.transform(image)
         obs = {"visual": image, "proprio": proprio}
-        return obs, act, state, {'shape': shape}
+        return obs, act, state, {}
 
     def __getitem__(self, idx):
         return self.get_frames(idx, range(self.get_seq_length(idx)))

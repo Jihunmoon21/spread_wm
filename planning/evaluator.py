@@ -29,6 +29,7 @@ class PlanEvaluator:  # evaluator for planning
         n_plot_samples,
         # lora 관련 인자 추가 (기본값으로 호환성 유지)
         is_lora_enabled=False,
+        is_online_lora=False,
         workspace=None,
     ):
         self.obs_0 = obs_0
@@ -48,24 +49,19 @@ class PlanEvaluator:  # evaluator for planning
         # lora 학습을 위한 관련 설정 초기화
         self.workspace = workspace  # PlanWorkspace 인스턴스 참조
         self.is_lora_enabled = self.workspace.is_lora_enabled if self.workspace is not None else is_lora_enabled
-        # # workspace로부터 optimizer와 loss_fn 가져오기
-        # if self.is_lora_enabled:
-        #     self.lora_optimizer = self.workspace.lora_optimizer
-        #     print(f"LoRA enabled: {self.is_lora_enabled}, Online LoRA: {self.is_online_lora}")
+        self.is_online_lora = self.workspace.is_online_lora if self.workspace is not None else is_online_lora
+        # workspace로부터 optimizer와 loss_fn 가져오기
+        if self.is_lora_enabled:
+            print(f"LoRA enabled: {self.is_lora_enabled}, Online LoRA: {self.is_online_lora}")
             
-        #     # LoRA 파라미터 상태 확인
-        #     if hasattr(self.wm, 'predictor') and hasattr(self.wm.predictor, 'lora_vit'):
-        #         total_params = sum(p.numel() for p in self.wm.parameters())
-        #         trainable_params = sum(p.numel() for p in self.wm.parameters() if p.requires_grad)
-        #         # print(f"Model parameters - Total: {total_params:,}, Trainable: {trainable_params:,}")
+            # LoRA 파라미터 상태 확인
+            if hasattr(self.wm, 'predictor') and hasattr(self.wm.predictor, 'lora_vit'):
+                total_params = sum(p.numel() for p in self.wm.parameters())
+                trainable_params = sum(p.numel() for p in self.wm.parameters() if p.requires_grad)
+                print(f"Model parameters - Total: {total_params:,}, Trainable: {trainable_params:,} ({(trainable_params / total_params) * 100 if total_params > 0 else 0:.4f}%)")
                 
-        #         # LoRA 파라미터 상세 정보 (수정된 부분)
-        #         if hasattr(self.wm.predictor, 'wnew_As'):
-        #             # 각 레이어(layer) 내부의 파라미터(p)를 순회하도록 수정
-        #             lora_params = sum(p.numel() for layer in self.wm.predictor.wnew_As + self.wm.predictor.wnew_Bs for p in layer.parameters())
-        #             print(f"LoRA parameters: {lora_params:,}")
-        #     else:
-        #         print("Warning: LoRA predictor not found in world model")
+            else:
+                print("Warning: LoRA predictor not found in world model")
             
         #     # LoRA 파라미터 변화량 추적을 위한 변수 초기화
         #     self._prev_lora_params = None

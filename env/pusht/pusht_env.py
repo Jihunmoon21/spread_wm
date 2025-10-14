@@ -104,7 +104,8 @@ class PymunkKeypointManager:
                 self.agent = obj = self.add_circle((256, 400), 15)
                 n_kps = n_agent_kps
             else:
-                self.block = obj = self.add_tee((256, 300), 0)
+                self.block = self.add_shape(self.shape, (256, 300), 0, color=self.color, scale=40)
+                # self.block = obj = self.add_tee((256, 300), 0)
                 n_kps = n_block_kps
 
             self.screen = pygame.Surface((512, 512))
@@ -360,7 +361,7 @@ def pymunk_to_shapely(body, shapes):
     geom = sg.MultiPolygon(geoms)
     return geom
 
-
+# PushTEnv 클래스
 class PushTEnv(gym.Env):
     metadata = {"render.modes": ["human", "rgb_array"], "video.frames_per_second": 10}
     reward_range = (0.0, 1.0)
@@ -379,9 +380,11 @@ class PushTEnv(gym.Env):
         with_target=True,
         shape="T",  # shape can be "T" <- the original shape, "I", "L", "Z", "square" and "small_tee"
         color="LightSlateGray",
+        background_color="White",  # 배경색 추가
     ):  
         self.shape = shape
         self.color = color
+        self.background_color = background_color
         self._seed = None
         self.seed()
         self.window_size = ws = 512  # The size of the PyGame window
@@ -601,7 +604,15 @@ class PushTEnv(gym.Env):
             self.clock = pygame.time.Clock()
 
         canvas = pygame.Surface((self.window_size, self.window_size))
-        canvas.fill((255, 255, 255)) # (255, 255, 255)
+        # 배경색을 설정된 색상으로 변경
+        if self.background_color == "Black":
+            canvas.fill((0, 0, 0))
+        elif self.background_color == "Red":
+            canvas.fill((255, 0, 0))
+        elif self.background_color == "White":
+            canvas.fill((255, 255, 255))
+        else:
+            canvas.fill((255, 255, 255))  # 기본값
         self.screen = canvas
 
         draw_options = DrawOptions(canvas)
@@ -1051,111 +1062,6 @@ class PushTEnv(gym.Env):
             raise ValueError(f"Unknown shape type: {shape}")
 
 
-class PymunkKeypointManager:
-    def __init__(
-        self,
-        local_keypoint_map: Dict[str, np.ndarray],
-        color_map: Optional[Dict[str, np.ndarray]] = None,
-    ):
-        """
-        local_keypoint_map:
-            "<attribute_name>": (N,2) floats in object local coordinate
-        """
-        if color_map is None:
-            cmap = cm.get_cmap("tab10")
-            color_map = dict()
-            for i, key in enumerate(local_keypoint_map.keys()):
-                color_map[key] = (np.array(cmap.colors[i]) * 255).astype(np.uint8)
-
-        self.local_keypoint_map = local_keypoint_map
-        self.color_map = color_map
-
-    @property
-    def kwargs(self):
-        return {
-            "local_keypoint_map": self.local_keypoint_map,
-            "color_map": self.color_map,
-        }
-
-    @classmethod
-    def create_from_pusht_env(cls, env, n_block_kps=9, n_agent_kps=3, seed=0, **kwargs):
-        rng = np.random.default_rng(seed=seed)
-        local_keypoint_map = dict()
-        for name in ["block", "agent"]:
-            self = env
-            self.space = pymunk.Space()
-            if name == "agent":
-                self.agent = obj = self.add_circle((256, 400), 15)
-                n_kps = n_agent_kps
-            else:
-                self.block = obj = self.add_tee((256, 300), 0)
-                n_kps = n_block_kps
-
-            self.screen = pygame.Surface((512, 512))
-            self.screen.fill(pygame.Color("white"))
-            draw_options = DrawOptions(self.screen)
-            self.space.debug_draw(draw_options)
-            # pygame.display.flip()
-            img = np.uint8(pygame.surfarray.array3d(self.screen).transpose(1, 0, 2))
-            obj_mask = (img != np.array([255, 255, 255], dtype=np.uint8)).any(axis=-1)
-
-            tf_img_obj = cls.get_tf_img_obj(obj)
-            xy_img = np.moveaxis(np.array(np.indices((512, 512))), 0, -1)[:, :, ::-1]
-            local_coord_img = tf_img_obj.inverse(xy_img.reshape(-1, 2)).reshape(
-                xy_img.shape
-            )
-            obj_local_coords = local_coord_img[obj_mask]
-
-            # furthest point sampling
-            init_idx = rng.choice(len(obj_local_coords))
-            obj_local_kps = farthest_point_sampling(obj_local_coords, n_kps, init_idx)
-            small_shift = rng.uniform(0, 1, size=obj_local_kps.shape)
-            obj_local_kps += small_shift
-
-            local_keypoint_map[name] = obj_local_kps
-
-        return cls(local_keypoint_map=local_keypoint_map, **kwargs)
-
-    @staticmethod
-    def get_tf_img(pose: Sequence):
-        pos = pose[:2]
-        rot = pose[2]
-        tf_img_obj = st.AffineTransform(translation=pos, rotation=rot)
-        return tf_img_obj
-
-    @classmethod
-    def get_tf_img_obj(cls, obj: pymunk.Body):
-        pose = tuple(obj.position) + (obj.angle,)
-        return cls.get_tf_img(pose)
-
-    def get_keypoints_global(
-        self, pose_map: Dict[set, Union[Sequence, pymunk.Body]], is_obj=False
-    ):
-        kp_map = dict()
-        for key, value in pose_map.items():
-            if is_obj:
-                tf_img_obj = self.get_tf_img_obj(value)
-            else:
-                tf_img_obj = self.get_tf_img(value)
-            kp_local = self.local_keypoint_map[key]
-            kp_global = tf_img_obj(kp_local)
-            kp_map[key] = kp_global
-        return kp_map
-
-    def draw_keypoints(self, img, kps_map, radius=1):
-        scale = np.array(img.shape[:2]) / np.array([512, 512])
-        for key, value in kps_map.items():
-            color = self.color_map[key].tolist()
-            coords = (value * scale).astype(np.int32)
-            for coord in coords:
-                cv2.circle(img, coord, radius=radius, color=color, thickness=-1)
-        return img
-
-    def draw_keypoints_pose(self, img, pose_map, is_obj=False, **kwargs):
-        kp_map = self.get_keypoints_global(pose_map, is_obj=is_obj)
-        return self.draw_keypoints(img, kps_map=kp_map, **kwargs)
-
-
 class PushTKeypointsEnv(PushTEnv):
     def __init__(
         self,
@@ -1183,7 +1089,10 @@ class PushTKeypointsEnv(PushTEnv):
 
         if local_keypoint_map is None:
             # create default keypoint definition
-            kp_kwargs = self.genenerate_keypoint_manager_params()
+            kp_kwargs = self.genenerate_keypoint_manager_params(
+                shape=self.shape,  # ← 현재 환경의 shape 전달
+                color=self.color   # ← 현재 환경의 color 전달
+            )
             local_keypoint_map = kp_kwargs["local_keypoint_map"]
             color_map = kp_kwargs["color_map"]
 
@@ -1221,8 +1130,8 @@ class PushTKeypointsEnv(PushTEnv):
         self.draw_kp_map = None
 
     @classmethod
-    def genenerate_keypoint_manager_params(cls):
-        env = PushTEnv()
+    def genenerate_keypoint_manager_params(cls, shape="square", color="LightSlateGray", **kwargs):
+        env = PushTEnv(shape=shape, color=color, **kwargs)
         kp_manager = PymunkKeypointManager.create_from_pusht_env(env)
         kp_kwargs = kp_manager.kwargs
         return kp_kwargs

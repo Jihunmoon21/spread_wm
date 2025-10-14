@@ -111,7 +111,7 @@ class MPCPlanner(BasePlanner):
             logs, successes, e_obses, e_states = self.evaluator.eval_actions(
                 action_so_far,
                 self.action_len,
-                filename=f"plan{self.iter}",
+                filename=f"{self.logging_prefix}_plan{self.iter}",
                 save_video=True,
             )
             new_successes = successes & ~self.is_success  # Identify new successes

@@ -1,4 +1,5 @@
 import torch
+import time
 from collections import deque
 from utils import move_to_device # spread_wm의 유틸리티 함수
 
@@ -28,7 +29,7 @@ class OnlineLora:
         self.proprio_loss_weight = self.cfg.get("proprio_loss_weight", 0.3)
 
         # 기존 모델 파라미터 고정
-        print("INFO: Freezing all non-LoRA parameters for online learning...")
+        print("INFO: Freezing all non-LoRA parameters for online learning.")
         for name, param in self.wm.named_parameters():
             if 'lora' not in name:
                 param.requires_grad = False
@@ -42,6 +43,14 @@ class OnlineLora:
         self.loss_fn = torch.nn.MSELoss()
 
         # --- 2. Online-LoRA (적층) 관련 변수 초기화 ---
+        # 하이브리드 적층 설정 (online 모드 여부와 관계없이 항상 초기화)
+        self.hybrid_config = self.cfg.get("hybrid_stacking", {})
+        self.hybrid_enabled = self.hybrid_config.get("enabled", False)
+        self.task_based_stacking = self.hybrid_config.get("task_based_stacking", False)
+        self.loss_based_stacking = self.hybrid_config.get("loss_based_stacking", False)
+        self.max_stacks_per_task = self.hybrid_config.get("max_stacks_per_task", 3)
+        self.stack_type_tracking = self.hybrid_config.get("stack_type_tracking", True)
+        
         if self.is_online_lora:
             print("INFO: Initializing Online LoRA module for dynamic stacking.")
             self.loss_window = deque(maxlen=self.cfg.get("loss_window_length", 10))
@@ -53,6 +62,26 @@ class OnlineLora:
             self.new_peak_detected = True
             self.last_loss_mean = float('inf')
             self.last_loss_var = float('inf')
+            
+            # 태스크별 적층 추적
+            self.stacks_in_current_task = 0
+            self.current_task_id = 0
+            self.stack_history = []  # 적층 히스토리 (타입, 시점, Loss 등)
+            
+            if self.hybrid_enabled:
+                print(f"INFO: Hybrid stacking enabled - Task-based: {self.task_based_stacking}, Loss-based: {self.loss_based_stacking}")
+                print(f"INFO: Max stacks per task: {self.max_stacks_per_task}")
+        else:
+            # online 모드가 아닌 경우에도 기본값으로 초기화
+            self.stacks_in_current_task = 0
+            self.current_task_id = 0
+            self.stack_history = []
+            
+        # 마지막 Loss 값 저장용 (태스크 전환을 위해)
+        self.last_loss = None
+        
+        # LoRA 적층 콜백 함수 (태스크 추적을 위해)
+        self.on_lora_stack_callback = None
 
 
     def update(self, trans_obs_0, actions, e_obses):
@@ -62,10 +91,18 @@ class OnlineLora:
         # 학습 단계 수행 (예측, 손실 계산, 역전파, 업데이트)
         total_loss_value = self._perform_training_step(trans_obs_0, actions, e_obses)
         
+        # 마지막 Loss 값 저장 (태스크 전환을 위해)
+        if total_loss_value is not None:
+            self.last_loss = total_loss_value
+        
         # 학습이 성공적으로 이루어졌고, online_lora 기능이 활성화되었다면
         if total_loss_value is not None and self.is_online_lora:
-            # Loss Window를 관리하고 LoRA 적층 여부를 판단
-            self._manage_loss_window_and_stacking(total_loss_value)
+            # 하이브리드 적층 로직
+            if self.hybrid_enabled:
+                self._manage_hybrid_stacking(total_loss_value)
+            else:
+                # 기존 Loss 기반 적층 로직
+                self._manage_loss_window_and_stacking(total_loss_value)
 
 
     def _perform_training_step(self, trans_obs_0, actions, e_obses):
@@ -78,7 +115,7 @@ class OnlineLora:
 
             # 2. 정답 준비 (그래디언트 비활성화)
             with torch.no_grad():
-                trans_obs_gt = self.workspace.preprocessor.transform_obs(e_obses)
+                trans_obs_gt = self.workspace.data_preprocessor.transform_obs(e_obses)
                 trans_obs_gt = move_to_device(trans_obs_gt, self.device)
                 i_z_obses_gt = self.wm.encode_obs(trans_obs_gt)
 
@@ -144,21 +181,36 @@ class OnlineLora:
             var < self.variance_threshold and
             self.steps_since_last_stack > self.min_steps_for_stack):
             
+            # 최대 적층 횟수 확인
+            if self.stacks_in_current_task >= self.max_stacks_per_task:
+                print(f"⚠️  Max stacks per task ({self.max_stacks_per_task}) reached. Skipping loss-based stacking.")
+                return
+            
             print("! Loss plateau detected. Triggering LoRA stacking process !")
             
-            # --- LoRA 적층 수행 ---
-            print("Performing LoRA stacking...")
-            self.wm.predictor.update_and_reset_lora_parameters()
+            # Loss 기반 적층 수행
+            success = self._perform_lora_stacking("loss_based", self.current_task_id, "loss_plateau")
             
-            # --- 옵티마이저 재설정 (새로운 wnew 파라미터들만 학습) ---
-            print("Resetting optimizer for new LoRA parameters...")
-            self._reset_optimizer_for_new_lora()
-            
-            # 적층 완료 로그
-            print("LoRA stacking completed successfully!")
-            print(f"   - Loss mean: {mean:.6f} (threshold: {self.mean_threshold})")
-            print(f"   - Loss variance: {var:.6f} (threshold: {self.variance_threshold})")
-            print(f"   - Steps since last stack: {self.steps_since_last_stack}")
+            if success:
+                # 적층 횟수 증가
+                self.stacks_in_current_task += 1
+                
+                # 적층 히스토리 기록
+                if self.hybrid_enabled and self.stack_type_tracking:
+                    self.stack_history.append({
+                        'type': 'loss_based',
+                        'task_id': self.current_task_id,
+                        'reason': 'loss_plateau',
+                        'step': self.steps_since_last_stack,
+                        'loss_mean': mean,
+                        'loss_var': var,
+                        'timestamp': time.time()
+                    })
+                
+                print(f"   - Loss mean: {mean:.6f} (threshold: {self.mean_threshold})")
+                print(f"   - Loss variance: {var:.6f} (threshold: {self.variance_threshold})")
+                print(f"   - Steps since last stack: {self.steps_since_last_stack}")
+                print(f"   - Stacks in current task: {self.stacks_in_current_task}/{self.max_stacks_per_task}")
             
             # 상태 변수 초기화
             self.new_peak_detected = False
@@ -166,6 +218,94 @@ class OnlineLora:
             self.last_loss_var = var
             self.steps_since_last_stack = 0
             self.loss_window.clear()
+
+    def _manage_hybrid_stacking(self, current_loss_value):
+        """
+        하이브리드 적층 로직: 태스크 기반과 Loss 기반 적층을 모두 고려합니다.
+        """
+        # Loss 기반 적층 (기존 로직)
+        if self.loss_based_stacking:
+            self._manage_loss_window_and_stacking(current_loss_value)
+    
+    def trigger_task_based_stacking(self, task_id, reason="task_change"):
+        """
+        태스크 기반 적층을 트리거합니다.
+        
+        Args:
+            task_id: 새로운 태스크 ID
+            reason: 적층 이유 ("task_change", "manual", etc.)
+        """
+        # hybrid_enabled 속성이 없거나 False인 경우 적층하지 않음
+        if not hasattr(self, 'hybrid_enabled') or not self.hybrid_enabled or not self.task_based_stacking:
+            return False
+            
+        # 태스크가 변경된 경우
+        if task_id != self.current_task_id:
+            self.current_task_id = task_id
+            self.stacks_in_current_task = 0
+            print(f"🔄 Task changed to {task_id}. Resetting stack counter.")
+        
+        # 최대 적층 횟수 확인
+        if self.stacks_in_current_task >= self.max_stacks_per_task:
+            print(f"⚠️  Max stacks per task ({self.max_stacks_per_task}) reached. Skipping task-based stacking.")
+            return False
+        
+        # 태스크 기반 적층 수행
+        print(f"🎯 Task-based LoRA stacking triggered (Task {task_id}, Reason: {reason})")
+        success = self._perform_lora_stacking("task_based", task_id, reason)
+        
+        if success:
+            self.stacks_in_current_task += 1
+            self.steps_since_last_stack = 0
+            
+            # 적층 히스토리 기록
+            if self.stack_type_tracking:
+                self.stack_history.append({
+                    'type': 'task_based',
+                    'task_id': task_id,
+                    'reason': reason,
+                    'step': self.steps_since_last_stack,
+                    'timestamp': time.time()
+                })
+        
+        return success
+    
+    def _perform_lora_stacking(self, stack_type, task_id, reason):
+        """
+        실제 LoRA 적층을 수행합니다.
+        
+        Args:
+            stack_type: "task_based" 또는 "loss_based"
+            task_id: 태스크 ID
+            reason: 적층 이유
+        
+        Returns:
+            bool: 적층 성공 여부
+        """
+        try:
+            print(f"Performing {stack_type} LoRA stacking...")
+            
+            # --- LoRA 적층 수행 ---
+            self.wm.predictor.update_and_reset_lora_parameters()
+            
+            # --- 옵티마이저 재설정 ---
+            self._reset_optimizer_for_new_lora()
+            
+            # 적층 완료 로그
+            print(f"{stack_type.title()} LoRA stacking completed successfully!")
+            print(f"   - Task ID: {task_id}")
+            print(f"   - Reason: {reason}")
+            print(f"   - Stacks in current task: {self.stacks_in_current_task + 1}/{self.max_stacks_per_task}")
+            
+            # LoRA 적층 콜백 호출 (태스크 추적을 위해)
+            if self.on_lora_stack_callback:
+                self.on_lora_stack_callback(self.steps_since_last_stack, self.last_loss)
+            
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error during {stack_type} LoRA stacking: {e}")
+            return False
 
     def _reset_optimizer_for_new_lora(self):
         """적층 후 새로운 wnew 파라미터들만 학습하도록 옵티마이저를 재설정합니다."""
