@@ -164,6 +164,7 @@ class PlanWorkspace:
         # --- LoRA 학습 관련 설정 및 객체 생성 ---
         self.online_learner = None # OnlineLora 객체를 담을 변수
         self.is_lora_enabled = self.cfg_dict.get("lora", {}).get("enabled", False)
+        self.is_online_lora = self.cfg_dict.get("lora", {}).get("online", False)
 
         if self.is_lora_enabled:
             print("INFO: LoRA training enabled. Initializing OnlineLora module.")
@@ -183,6 +184,7 @@ class PlanWorkspace:
             n_plot_samples=self.cfg_dict["n_plot_samples"],
             workspace=self, # workspace를 evaluator에 전달하는 것은 그대로 유지
             is_lora_enabled=self.is_lora_enabled,
+            is_online_lora=self.is_online_lora,
         )
 
         if self.wandb_run is None or isinstance(
@@ -474,6 +476,11 @@ def planning_main(cfg_dict):
     )
     model = load_model(model_ckpt, model_cfg, num_action_repeat, device=device)
 
+    env_config = {}
+    if "environment" in cfg_dict:
+        env_config = cfg_dict["environment"]
+        print(f"Environment config: {env_config}")
+
     # use dummy vector env for wall and deformable envs
     if model_cfg.env.name == "wall" or model_cfg.env.name == "deformable_env":
         from env.serial_vector_env import SerialVectorEnv
@@ -489,7 +496,7 @@ def planning_main(cfg_dict):
         env = SubprocVectorEnv(
             [
                 lambda: gym.make(
-                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs
+                    model_cfg.env.name, *model_cfg.env.args, **model_cfg.env.kwargs, **env_config
                 )
                 for _ in range(cfg_dict["n_evals"])
             ]

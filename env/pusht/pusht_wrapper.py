@@ -9,10 +9,16 @@ class PushTWrapper(PushTEnv):
             self, 
             with_velocity=True,
             with_target=True,
+            shape="I",
+            color="LightSlateGray",
+            background_color="White",
         ):
         super().__init__(
             with_velocity=with_velocity,
-            with_target=with_target, 
+            with_target=with_target,
+            shape=shape,
+            color=color,
+            background_color=background_color,
         )
         self.action_dim = self.action_space.shape[0]
     
@@ -52,8 +58,13 @@ class PushTWrapper(PushTEnv):
         return init_state, goal_state
     
     def update_env(self, env_info):
-        self.shape = env_info['shape']
-    
+        if 'shape' in env_info:
+            self.shape = env_info['shape']
+        if 'color' in env_info:
+            self.color = env_info['color']
+        if 'background_color' in env_info:
+            self.background_color = env_info['background_color']
+            
     def eval_state(self, goal_state, cur_state):
         """
         Return True if the goal is reached

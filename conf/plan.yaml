@@ -51,10 +51,26 @@ lora:
   
   # LoRA 적층 관련 설정 (online=true일 때만 사용)
   loss_window_length: 5                    # Loss window 크기
-  loss_window_mean_threshold: 0.01          # Loss 평균 임계값
+  loss_window_mean_threshold: 0.1          # Loss 평균 임계값
   loss_window_variance_threshold: 1e-5      # Loss 분산 임계값
-  min_steps_for_stack: 50                   # 최소 스텝 수 (적층 간격)
+  min_steps_for_stack: 30                   # 최소 스텝 수 (적층 간격)
+  
+  # 하이브리드 적층 설정
+  hybrid_stacking:
+    enabled: true                    # 하이브리드 적층 활성화
+    task_based_stacking: true        # 태스크 변경 시 적층
+    loss_based_stacking: false        # Loss plateau 시 적층
+    max_stacks_per_task: 3           # 태스크당 최대 적층 횟수
+    stack_type_tracking: true        # 적층 타입별 추적
   
   # Loss 가중치 (설정 파일에 없는 경우 기본값 사용)
   visual_loss_weight: 1.0
   proprio_loss_weight: 0.3
+
+  # Loss 기반 태스크 전환 설정
+  task_switch:
+    enabled: true                    # Loss 기반 태스크 전환 활성화
+    loss_threshold: 0.1              # Loss 임계값 (이 값 이하로 떨어지면 다음 태스크로)
+    loss_window_size: 1              # 태스크 전환용 Loss window 크기
+    max_planning_per_task: 1000        # 최대 플래닝 횟수 (무한 루프 방지)
+    min_planning_per_task: 10         # 최소 플래닝 횟수 (너무 빨리 넘어가는 것 방지)
