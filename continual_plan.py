@@ -8,13 +8,17 @@ import pickle
 import wandb
 import logging
 import warnings
-import time
 import numpy as np
+from utils import move_to_device
+import time
 import submitit
 from itertools import product
 from pathlib import Path
 from einops import rearrange
 from omegaconf import OmegaConf, open_dict
+import sys
+import io
+from contextlib import redirect_stdout
 
 from env.venv import SubprocVectorEnv
 from custom_resolvers import replace_slash
@@ -26,6 +30,7 @@ from collections import deque
 from models.vit import ViTPredictor
 from models.lora import LoRA_ViT_spread
 from planning.online import OnlineLora
+from planning.lora_ensemble import EnsembleOnlineLora
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -124,6 +129,7 @@ class PlanWorkspace:
         env_name: str,
         frameskip: int,
         wandb_run: wandb.run,
+        current_task_id: int = None,  # 현재 태스크 ID 추가
     ):
         # --- 1. 기본 속성 초기화 ---
         self.cfg_dict = cfg_dict
@@ -133,6 +139,7 @@ class PlanWorkspace:
         self.env_name = env_name
         self.frameskip = frameskip
         self.wandb_run = wandb_run
+        self.current_task_id = current_task_id  # 현재 태스크 ID 저장
         self.device = next(wm.parameters()).device
         
         self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
@@ -163,14 +170,21 @@ class PlanWorkspace:
             self.prepare_targets()
 
         # --- LoRA 학습 관련 설정 및 객체 생성 ---
-        self.online_learner = None # OnlineLora 객체를 담을 변수
+        self.online_learner = None # OnlineLora 또는 EnsembleOnlineLora 객체를 담을 변수
         self.is_lora_enabled = self.cfg_dict.get("lora", {}).get("enabled", False)
         self.is_online_lora = self.cfg_dict.get("lora", {}).get("online", False)
 
         if self.is_lora_enabled:
-            print("INFO: LoRA training enabled. Initializing OnlineLora module.")
-            # OnlineLora 객체를 생성하고, workspace 전체를 넘겨 Evaluator에서 접근할 수 있도록
-            self.online_learner = OnlineLora(workspace=self)
+            # 앙상블 LoRA 사용 여부 확인
+            # lora.ensemble로 플래그 경로 변경
+            use_ensemble_lora = self.cfg_dict.get("lora", {}).get("ensemble", False)
+            
+            if use_ensemble_lora:
+                print("INFO: Ensemble LoRA training enabled. Initializing EnsembleOnlineLora module.")
+                self.online_learner = EnsembleOnlineLora(workspace=self)
+            else:
+                print("INFO: Standard LoRA training enabled. Initializing OnlineLora module.")
+                self.online_learner = OnlineLora(workspace=self)
 
         self.evaluator = PlanEvaluator(
             obs_0=self.obs_0,
@@ -194,16 +208,27 @@ class PlanWorkspace:
             self.wandb_run = DummyWandbRun()
 
         self.log_filename = "logs.json"  # planner and final eval logs are dumped here
+        # 🔧 앙상블 매니저를 플래너에 전달
+        planner_kwargs = {
+            "wm": self.wm,
+            "env": self.env,  # only for mpc
+            "action_dim": self.action_dim,
+            "objective_fn": objective_fn,
+            "preprocessor": self.data_preprocessor,
+            "evaluator": self.evaluator,
+            "wandb_run": self.wandb_run,
+            "log_filename": self.log_filename,
+        }
+        
+        # 앙상블 LoRA가 활성화된 경우 앙상블 매니저 전달
+        if (self.is_online_lora and 
+            hasattr(self.online_learner, 'ensemble_manager')):
+            planner_kwargs["ensemble_manager"] = self.online_learner.ensemble_manager
+            print(f"🔧 Passing ensemble manager to planner")
+        
         self.planner = hydra.utils.instantiate(
             self.cfg_dict["planner"],
-            wm=self.wm,
-            env=self.env,  # only for mpc
-            action_dim=self.action_dim,
-            objective_fn=objective_fn,
-            preprocessor=self.data_preprocessor,
-            evaluator=self.evaluator,
-            wandb_run=self.wandb_run,
-            log_filename=self.log_filename,
+            **planner_kwargs
         )
 
         # optional: assume planning horizon equals to goal horizon
@@ -346,11 +371,50 @@ class PlanWorkspace:
             actions_init = self.gt_actions
         else:
             actions_init = None
-        actions, action_len = self.planner.plan(
-            obs_0=self.obs_0,
-            obs_g=self.obs_g,
-            actions=actions_init,
-        )
+
+        # 🔧 태스크 전환 감지 및 처리 (재호출 제거: 바깥에서 이미 설정된 플래그 사용)
+        if self.is_online_lora and hasattr(self.online_learner, 'task_changed'):
+            # 현재 태스크 ID는 워크스페이스 생성 시 주입됨; 여기서 재계산/재호출하지 않음
+            task_changed = self.online_learner.task_changed
+        
+        # 🔧 태스크 전환 시에만 앙상블 추론 사용
+        # lora.ensemble_cfg로 경로 변경 (없으면 빈 dict)
+        ensemble_cfg = self.cfg_dict.get("lora", {}).get("ensemble_cfg", {})
+        inference_cfg = ensemble_cfg.get("inference", {})
+        usage_strategy = inference_cfg.get("usage_strategy", "task_change_only")
+        
+        if (usage_strategy in ["task_change_only", "always"] and 
+            self.is_online_lora and 
+            hasattr(self.online_learner, 'ensemble_manager') and
+            len(self.online_learner.ensemble_manager.ensemble_members) > 0 and
+            (usage_strategy == "always" or 
+             (hasattr(self.online_learner, 'task_changed') and self.online_learner.task_changed))):
+            if usage_strategy == "always":
+                print(f"🔄 Using ensemble for optimal member selection (always mode)...")
+            else:
+                print(f"🔄 Task changed! Using ensemble for optimal member selection...")
+            
+            # 태스크 전환 시 앙상블 기반 최적 멤버 선택
+            self.perform_task_change_ensemble_selection()
+            
+            # task_changed 플래그 리셋
+            if hasattr(self.online_learner, 'reset_task_changed_flag'):
+                self.online_learner.reset_task_changed_flag()
+            
+            # 일반 플래닝 수행 (선택된 멤버 사용)
+            actions, action_len = self.planner.plan(
+                obs_0=self.obs_0,
+                obs_g=self.obs_g,
+                actions=actions_init,
+            )
+        else:
+            # 기존 방식: 일반 플래닝 수행
+            actions, action_len = self.planner.plan(
+                obs_0=self.obs_0,
+                obs_g=self.obs_g,
+                actions=actions_init,
+            )
+        
         logs, successes, _, _ = self.evaluator.eval_actions(
             actions.detach(), action_len, save_video=True, filename="output_final"
         )
@@ -367,6 +431,399 @@ class PlanWorkspace:
         with open(self.log_filename, "a") as file:
             file.write(json.dumps(logs_entry) + "\n")
         return logs
+    
+    
+    def perform_task_change_ensemble_selection(self):
+        """
+        태스크 전환 시 새로운 태스크에 대한 실제 성능 평가를 통한 최적 멤버 선택 및 적층
+        
+        새로운 태스크에 대한 각 멤버의 실제 성능을 평가하여:
+        1. 새로운 태스크에 대한 각 멤버의 실제 성능 평가
+        2. 실제 성능 기반 최적 멤버 선택
+        3. loss 임계값 확인 후 LoRA 적층 여부 결정
+        """
+        print(f"🎯 Performing task change ensemble selection with task-specific evaluation...")
+        
+        ensemble_cfg = self.cfg_dict.get("lora", {}).get("ensemble_cfg", {})
+        inference_cfg = ensemble_cfg.get("inference", {})
+        
+        # 설정 확인
+        task_change_evaluation = inference_cfg.get("task_change_evaluation", True)
+        task_specific_evaluation = inference_cfg.get("task_specific_evaluation", True)
+        select_best_member = inference_cfg.get("select_best_member", True)
+        stack_on_selected = inference_cfg.get("stack_on_selected", True)
+        evaluation_loss_threshold = inference_cfg.get("evaluation_loss_threshold", 0.1)
+        
+        if not task_change_evaluation:
+            print(f"⚠️  Task change evaluation disabled, skipping ensemble selection")
+            return
+        
+        if not task_specific_evaluation:
+            print(f"⚠️  Task-specific evaluation disabled, using stored performance")
+            # 기존 방식으로 폴백 (저장된 성능 사용)
+            self.perform_legacy_ensemble_selection()
+            return
+        
+        try:
+            # 1. 🔧 새로운 태스크에 대한 각 멤버의 실제 성능 평가
+            print(f"📊 Evaluating ensemble members for new task...")
+            
+            member_performances = self.evaluate_members_for_new_task()
+            
+            if not member_performances:
+                print(f"⚠️  No valid member performances found")
+                return
+            
+            # 2. 실제 성능 기반 최적 멤버 선택
+            best_member_task_id, best_performance = min(member_performances, key=lambda x: x[1]['loss'])
+            
+            print(f"📈 Task-Specific Performance Results:")
+            for task_id, performance in member_performances:
+                print(f"   - Task {task_id}: Loss {performance['loss']:.6f}")
+            print(f"🏆 Best member for new task: Task {best_member_task_id} (Loss: {best_performance['loss']:.6f})")
+            
+            # 3. loss 임계값 확인 후 LoRA 적층 여부 결정
+            if best_performance['loss'] <= evaluation_loss_threshold:
+                print(f"✅ Best member loss ({best_performance['loss']:.6f}) < threshold ({evaluation_loss_threshold})")
+                print(f"🎯 No LoRA stacking needed - using best member directly")
+                
+                # 최적 멤버를 현재 모델에 적용하되 새로운 LoRA 적층은 하지 않음
+                self.apply_best_member_without_stacking(best_member_task_id)
+            else:
+                print(f"⚠️  Best member loss ({best_performance['loss']:.6f}) > threshold ({evaluation_loss_threshold})")
+                print(f"🔧 LoRA stacking needed - stacking on best member")
+                
+                if stack_on_selected:
+                    # 선택된 멤버 위에 새로운 LoRA 적층
+                    self.stack_on_selected_member(best_member_task_id)
+                else:
+                    print(f"ℹ️  Stacking on selected member disabled")
+                
+        except Exception as e:
+            print(f"❌ Task change ensemble selection failed: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def evaluate_members_for_new_task(self):
+        """
+        새로운 태스크에 대한 각 앙상블 멤버의 실제 성능 평가
+        
+        Returns:
+            List[Tuple[str, Dict]]: (task_id, performance) 튜플 리스트
+        """
+        print(f"🔍 Evaluating each member for new task...")
+        
+        ensemble_cfg = self.cfg_dict.get("ensemble_lora", {})
+        inference_cfg = ensemble_cfg.get("inference", {})
+        evaluation_steps = inference_cfg.get("evaluation_steps", 5)
+        
+        # 🔍 디버그: 멤버별 LoRA 가중치가 실제로 다른지 해시 지문 출력
+        try:
+            import hashlib
+
+            def _tensor_hash(tensor_obj):
+                try:
+                    arr = tensor_obj.detach().cpu().contiguous().numpy()
+                    return hashlib.sha256(arr.tobytes()).hexdigest()
+                except Exception:
+                    return "NA"
+
+            def _member_fingerprint(lora_weights, sample_layers=4):
+                if not isinstance(lora_weights, dict) or not lora_weights:
+                    return "EMPTY"
+                keys = sorted(list(lora_weights.keys()))[:sample_layers]
+                parts = []
+                for k in keys:
+                    lw = lora_weights.get(k, {})
+                    if not isinstance(lw, dict):
+                        continue
+                    w_a = lw.get('w_A', None)
+                    w_b = lw.get('w_B', None)
+                    if w_a is not None:
+                        parts.append(_tensor_hash(w_a))
+                    if w_b is not None:
+                        parts.append(_tensor_hash(w_b))
+                return "|".join(parts) if parts else "EMPTY"
+
+            fingerprints = {}
+            members = getattr(self.online_learner, 'ensemble_manager', None)
+            if members is not None and hasattr(members, 'ensemble_members'):
+                for m_task_id, m_info in members.ensemble_members.items():
+                    fp = _member_fingerprint(m_info.get('lora_weights', {}))
+                    fingerprints[m_task_id] = fp
+                    print(f"🔍 Ensemble fingerprint - Task {m_task_id}: {fp}")
+
+                # 동일 지문 그룹 검출
+                fp_groups = {}
+                for tid, fp in fingerprints.items():
+                    fp_groups.setdefault(fp, []).append(tid)
+                duplicate_groups = [grp for grp in fp_groups.values() if len(grp) > 1]
+                if duplicate_groups:
+                    print(f"⚠️ Detected identical LoRA weights across members (sampled layers): {duplicate_groups}")
+                else:
+                    print("✅ All ensemble member fingerprints differ (on sampled layers)")
+        except Exception as e:
+            print(f"⚠️ Fingerprint logging failed: {e}")
+
+        member_performances = []
+        
+        # 현재 LoRA 상태 백업
+        original_w_As = None
+        original_w_Bs = None
+        
+        try:
+            if hasattr(self.wm.predictor, 'w_As') and hasattr(self.wm.predictor, 'w_Bs'):
+                original_w_As = [w_A.weight.data.clone() for w_A in self.wm.predictor.w_As]
+                original_w_Bs = [w_B.weight.data.clone() for w_B in self.wm.predictor.w_Bs]
+        except Exception as e:
+            print(f"⚠️  Warning: Could not backup LoRA weights: {e}")
+        
+        for task_id, member_info in self.online_learner.ensemble_manager.ensemble_members.items():
+            try:
+                print(f"📊 Evaluating member Task {task_id} for new task...")
+                
+                # 해당 멤버의 LoRA 가중치를 모델에 적용
+                lora_weights = member_info['lora_weights']
+                success = self.online_learner._apply_lora_weights(lora_weights)
+                
+                if not success:
+                    print(f"❌ Failed to apply LoRA weights for member {task_id}")
+                    continue
+                
+                # 새로운 태스크에 대한 실제 성능 평가
+                # evaluator.py의 eval_actions를 직접 사용하여 평가
+                performance = self.evaluate_member_for_current_task(
+                    actions=None,  # 내부에서 자동 생성
+                    evaluation_steps=evaluation_steps
+                )
+                
+                if performance is not None:
+                    member_performances.append((task_id, performance))
+                    print(f"   - Task {task_id}: Loss {performance['loss']:.6f}")
+                else:
+                    print(f"   - Task {task_id}: Evaluation failed")
+                
+            except Exception as e:
+                print(f"❌ Error evaluating member {task_id}: {e}")
+                continue
+        
+        # 원래 LoRA 상태 복원
+        if original_w_As is not None and original_w_Bs is not None:
+            self.online_learner._restore_lora_weights(original_w_As, original_w_Bs)
+        
+        print(f"✅ Evaluated {len(member_performances)} members for new task")
+        return member_performances
+    
+    def evaluate_member_for_current_task(self, actions=None, evaluation_steps=5):
+        """
+        evaluator.py의 eval_actions를 직접 사용하여 앙상블 멤버 평가
+        
+        Args:
+            actions: 계획된 행동 시퀀스 (evaluator.py와 동일)
+            evaluation_steps: 평가 시 사용할 스텝 수 (actions가 None일 때만 사용)
+            
+        Returns:
+            Dict: 성능 지표
+        """
+        try:
+            if actions is None:
+                # n_evals = 1
+                # actions = torch.randn(n_evals, evaluation_steps, self.action_dim, device=self.device)
+            # 1. 계획된 행동 생성: 플래너 사용 (없으면 랜덤으로 폴백)
+                try:
+                    planned_actions, action_len = self.planner.plan(
+                        obs_0=self.obs_0,
+                        obs_g=self.obs_g,
+                        actions=None,
+                    )
+                    actions = planned_actions
+                    if evaluation_steps is not None and planned_actions.shape[1] > evaluation_steps:
+                        actions = planned_actions[:, :evaluation_steps, :]
+                except Exception as e:
+                    print(f"⚠️  Fallback to random actions for ensemble evaluation: {e}")
+                    n_evals = 1
+                    actions = torch.randn(n_evals, evaluation_steps, self.action_dim, device=self.device)
+            
+            # 2. 터미널 출력 캡처를 위한 StringIO 사용
+            captured_output = io.StringIO()
+            with redirect_stdout(captured_output):
+                # evaluator.py의 eval_actions 직접 사용
+                logs, successes, e_obses, e_states = self.evaluator.eval_actions(
+                    actions=actions,
+                    action_len=None,  # evaluator.py가 자동으로 np.inf 설정
+                    filename="ensemble_eval",
+                    save_video=False
+                )
+            
+            # 3. 캡처된 출력에서 loss 값 파싱
+            output_text = captured_output.getvalue()
+            parsed_loss = self._parse_loss_from_output(output_text)
+            
+            if parsed_loss is not None:
+                print(f"   📊 Parsed Online Learning loss: {parsed_loss:.6f}")
+                
+                return {
+                    'loss': parsed_loss,
+                    'visual_loss': parsed_loss * 0.8,  # 근사값
+                    'proprio_loss': parsed_loss * 0.2,  # 근사값
+                    'success_rate': logs.get('success_rate', 0)
+                }
+            else:
+                print("   ❌ Failed to parse loss from output!")
+                return None
+            
+        except Exception as e:
+            print(f"❌ Error evaluating member: {e}")
+            return None
+    
+    def _parse_loss_from_output(self, output_text):
+        """
+        터미널 출력에서 loss 값을 파싱합니다.
+        
+        Args:
+            output_text: 캡처된 터미널 출력
+            
+        Returns:
+            float: 파싱된 loss 값 또는 None
+        """
+        try:
+            # 방법 1: PARSED_LOSS_START 마커 사용
+            if "PARSED_LOSS_START:" in output_text:
+                start_marker = "PARSED_LOSS_START:"
+                end_marker = ":PARSED_LOSS_END"
+                
+                start_idx = output_text.find(start_marker)
+                if start_idx != -1:
+                    start_idx += len(start_marker)
+                    end_idx = output_text.find(end_marker, start_idx)
+                    if end_idx != -1:
+                        loss_str = output_text[start_idx:end_idx]
+                        return float(loss_str)
+            
+            # 방법 2: "Total loss: " 패턴 사용
+            if "Total loss: " in output_text:
+                lines = output_text.split('\n')
+                for line in lines:
+                    if "Total loss: " in line:
+                        # "Total loss: 0.071619" 형태에서 숫자 추출
+                        parts = line.split("Total loss: ")
+                        if len(parts) > 1:
+                            loss_str = parts[1].strip()
+                            return float(loss_str)
+            
+            return None
+            
+        except Exception as e:
+            print(f"   ⚠️  Error parsing loss: {e}")
+            return None
+    
+    def apply_best_member_without_stacking(self, best_member_task_id):
+        """
+        최적 멤버를 현재 모델에 적용하되 새로운 LoRA 적층은 하지 않음
+        
+        Args:
+            best_member_task_id: 최적 멤버의 task_id
+        """
+        try:
+            print(f"🎯 Applying best member {best_member_task_id} without stacking...")
+            
+            if best_member_task_id in self.online_learner.ensemble_manager.ensemble_members:
+                member_info = self.online_learner.ensemble_manager.ensemble_members[best_member_task_id]
+                lora_weights = member_info['lora_weights']
+                
+                # 최적 멤버의 가중치를 모델에 적용 (적층 없이)
+                success = self.online_learner._apply_lora_weights(lora_weights)
+                
+                if success:
+                    print(f"✅ Successfully applied best member's LoRA weights without stacking")
+                    print(f"🎯 Using best member directly for new task")
+                else:
+                    print(f"❌ Failed to apply best member's LoRA weights")
+            else:
+                print(f"❌ Best member task {best_member_task_id} not found in ensemble members")
+                
+        except Exception as e:
+            print(f"❌ Error applying best member without stacking: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def perform_legacy_ensemble_selection(self):
+        """
+        기존 방식의 앙상블 선택 (저장된 성능 기반)
+        폴백용 메서드
+        """
+        print(f"🔄 Using legacy ensemble selection (stored performance)...")
+        
+        try:
+            # 기존 방식: 저장된 성능으로 최적 멤버 선택
+            best_member = self.online_learner.ensemble_manager.get_best_member(
+                input_data=self.obs_0,
+                metric='loss'
+            )
+            
+            if best_member is not None:
+                best_task_id = best_member['task_id']
+                print(f"🏆 Selected best ensemble member (legacy): Task {best_task_id}")
+                
+                # 선택된 멤버 위에 새로운 LoRA 적층
+                self.stack_on_selected_member(best_task_id)
+            else:
+                print(f"⚠️  No suitable ensemble member found (legacy)")
+                
+        except Exception as e:
+            print(f"❌ Legacy ensemble selection failed: {e}")
+    
+    
+    def stack_on_selected_member(self, selected_task_id):
+        """
+        선택된 멤버 위에 새로운 LoRA 적층
+        
+        LoRAEnsembleManager의 기존 _apply_lora_weights 메서드를 활용
+        
+        Args:
+            selected_task_id: 선택된 멤버의 task_id
+        """
+        try:
+            print(f"🔧 Stacking new LoRA on selected member: Task {selected_task_id}")
+            
+            # 선택된 멤버의 LoRA 가중치를 현재 모델에 적용
+            if selected_task_id in self.online_learner.ensemble_manager.ensemble_members:
+                member_info = self.online_learner.ensemble_manager.ensemble_members[selected_task_id]
+                lora_weights = member_info['lora_weights']
+                
+                # 🔧 EnsembleOnlineLora의 _apply_lora_weights 메서드 사용
+                success = self.online_learner._apply_lora_weights(lora_weights)
+                
+                if success:
+                    print(f"✅ Successfully applied selected member's LoRA weights")
+                    print(f"🔄 New LoRA will be stacked on top of selected member")
+                    
+                    # 실제 LoRA 적층 수행 (OnlineLora 경로로 위임)
+                    try:
+                        # 현재 태스크 ID를 명시적으로 전달
+                        current_task_id = getattr(self.online_learner, 'current_task_id', None)
+                        if current_task_id is None:
+                            current_task_id = task_id + 1 if 'task_id' in locals() else selected_task_id
+                        stacking_success = self.online_learner._perform_ensemble_lora_stacking(
+                            task_id=current_task_id,
+                            best_member=None,
+                            reason="task_change_eval"
+                        )
+                        if stacking_success:
+                            print("✅ Triggered actual LoRA stacking on selected member")
+                        else:
+                            print("❌ Failed to trigger actual LoRA stacking on selected member")
+                    except Exception as e:
+                        print(f"❌ Error triggering actual LoRA stacking: {e}")
+                else:
+                    print(f"❌ Failed to apply selected member's LoRA weights")
+            else:
+                print(f"❌ Selected task {selected_task_id} not found in ensemble members")
+                
+        except Exception as e:
+            print(f"❌ Error stacking on selected member: {e}")
+            import traceback
+            traceback.print_exc()
 
 
 def load_ckpt(snapshot_path, device):
@@ -475,34 +932,18 @@ def measure_forgetting_on_past_tasks(model, past_task_envs, plan_workspace, curr
                 past_plan_workspace.online_learner.last_loss is not None):
                 avg_loss = past_plan_workspace.online_learner.last_loss
             
-            # Loss 기반 retention rate 계산 (0.1과의 근접도)
-            target_loss = 0.1
-            if avg_loss is not None:
-                # Loss가 0.1보다 작으면 무조건 100% retention
-                if avg_loss <= target_loss:
-                    retention_rate = 100.0
-                else:
-                    # Loss가 0.1보다 클 때만 거리 기반 계산
-                    loss_distance = avg_loss - target_loss
-                    # 지수적 감소: distance가 클수록 retention이 빠르게 감소
-                    retention_rate = max(0, 100 * (1.0 - loss_distance / target_loss))
-            else:
-                retention_rate = 0.0
-            
             # 망각 측정 결과 저장
             result = {
                 'past_task_id': past_task_id,
                 'current_task_id': current_task_id,
                 'env_config': past_env_config,
                 'success_rate': success_rate,
-                'avg_loss': avg_loss if avg_loss is not None else 0.0,
-                'retention_rate': retention_rate,  # Loss 기반 유지율
-                'target_loss': target_loss  # 목표 Loss 추가
+                'avg_loss': avg_loss if avg_loss is not None else 0.0
             }
             forgetting_results.append(result)
             
             avg_loss_str = f"{avg_loss:.6f}" if avg_loss is not None else "N/A"
-            print(f"     → Task {past_task_id} Success Rate: {success_rate:.3f}, Loss: {avg_loss_str} (Target: {target_loss}, Retention: {retention_rate:.1f}%)")
+            print(f"     → Task {past_task_id} Success Rate: {success_rate:.3f}, Loss: {avg_loss_str}")
             
         except Exception as e:
             print(f"     → Error measuring Task {past_task_id}: {e}")
@@ -513,7 +954,6 @@ def measure_forgetting_on_past_tasks(model, past_task_envs, plan_workspace, curr
                 'env_config': past_env_config,
                 'success_rate': 0.0,
                 'avg_loss': 0.0,
-                'retention_rate': 0.0,
                 'error': str(e)
             })
     
@@ -573,25 +1013,31 @@ def planning_main(cfg_dict):
     # 11개의 서로 다른 환경 설정을 정의합니다.
     task_configs = [
         # Original (기본 설정)
-        {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
+        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
         
+        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
+        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
         # 블록 모양 변화
-        {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 2: 정사각형
-        {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
-        {'shape': 'L', 'color': 'LightSlateGray', 'background_color': 'White'},     # Task 4: L
-        
-        # 블록 색상 변화
-        {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
-        {'shape': 'T', 'color': 'Yellow', 'background_color': 'White'},             # Task 8: 블록 노랑
+        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
+        # {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 2: 정사각형
 
-        # 배경색 변화
-        {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
-        {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Red'},       # Task 6: 배경 빨강
+        # {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
+        {'shape': 'L', 'color': 'LightSlateGray', 'background_color': 'White'},     # Task 4: L
+        {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
+        # {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
+        {'shape': 'L', 'color': 'LightSlateGray', 'background_color': 'White'},     # Task 4: L
+        # # 블록 색상 변화
+        # {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
+        # {'shape': 'T', 'color': 'Yellow', 'background_color': 'White'},             # Task 8: 블록 노랑
+
+        # # 배경색 변화
+        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
+        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Red'},       # Task 6: 배경 빨강
         
-        # 복합적 변화 (맨 뒤에 배치)
-        {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'Black'}, # Task 9: 정사각형 + 배경 검정
-        {'shape': 'L', 'color': 'Yellow', 'background_color': 'White'},             # Task 10: L + 블록 노랑
-        {'shape': 'T', 'color': 'Black', 'background_color': 'Red'},              # Task 11: 블록 검정 + 배경 빨강
+        # # 복합적 변화 (맨 뒤에 배치)
+        # {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'Black'}, # Task 9: 정사각형 + 배경 검정
+        # {'shape': 'L', 'color': 'Yellow', 'background_color': 'White'},             # Task 10: L + 블록 노랑
+        # {'shape': 'T', 'color': 'Black', 'background_color': 'Red'},              # Task 11: 블록 검정 + 배경 빨강
     ]
     num_tasks = len(task_configs)
     overall_logs = []
@@ -637,7 +1083,18 @@ def planning_main(cfg_dict):
         task_cfg_dict["planner"]["logging_prefix"] = f"task_{task_id+1:02d}_plan"
         task_cfg_dict["planner"]["sub_planner"]["logging_prefix"] = f"task_{task_id+1:02d}_plan"
 
-        # 3-B. PlanWorkspace를 생성합니다. 모델(wm)은 계속 유지됩니다.
+        # 🔧 앙상블 멤버 백업 (태스크 전환 시)
+        ensemble_backup = None
+        if task_id > 0 and 'plan_workspace' in locals() and plan_workspace and hasattr(plan_workspace.online_learner, 'ensemble_manager'):
+            ensemble_backup = {
+                'members': dict(plan_workspace.online_learner.ensemble_manager.ensemble_members),
+                'memory_usage': plan_workspace.online_learner.ensemble_manager.memory_usage,
+                'access_frequency': dict(plan_workspace.online_learner.ensemble_manager.access_frequency) if hasattr(plan_workspace.online_learner.ensemble_manager, 'access_frequency') else {}
+            }
+            print(f"🔧 Backed up {len(ensemble_backup['members'])} ensemble members from previous task")
+
+        # 3-B. 새로운 PlanWorkspace 생성 (각 태스크마다)
+        print(f"🔧 Creating new PlanWorkspace for Task {task_id + 1}")
         plan_workspace = PlanWorkspace(
             cfg_dict=task_cfg_dict,
             wm=model,
@@ -646,16 +1103,77 @@ def planning_main(cfg_dict):
             env_name=model_cfg.env.name,
             frameskip=model_cfg.frameskip,
             wandb_run=wandb_run,
+            current_task_id=task_id + 1,
         )
         
-        # LoRA 적층 콜백 설정 (태스크 추적을 위해)
-        if plan_workspace.is_online_lora and hasattr(plan_workspace.online_learner, 'on_lora_stack_callback'):
-            def on_lora_stack(steps, loss):
+        # 🔧 앙상블 멤버 복원
+        if ensemble_backup and hasattr(plan_workspace.online_learner, 'ensemble_manager'):
+            plan_workspace.online_learner.ensemble_manager.ensemble_members = ensemble_backup['members']
+            plan_workspace.online_learner.ensemble_manager.memory_usage = ensemble_backup['memory_usage']
+            if hasattr(plan_workspace.online_learner.ensemble_manager, 'access_frequency'):
+                plan_workspace.online_learner.ensemble_manager.access_frequency = ensemble_backup['access_frequency']
+            print(f"🔧 Restored {len(ensemble_backup['members'])} ensemble members to new PlanWorkspace")
+            print(f"   - Memory usage: {ensemble_backup['memory_usage']:.2f}MB")
+        else:
+            print(f"🔧 Starting with fresh ensemble (no previous members)")
+        
+        # 🔧 태스크 전환 플래그 설정: 태스크 전환 시 앙상블 평가 조건 만족
+        try:
+            if (task_id >= 0 and hasattr(plan_workspace, 'online_learner') and
+                hasattr(plan_workspace.online_learner, 'check_task_change')):
+                changed = plan_workspace.online_learner.check_task_change(task_id + 1)
+                print(f"🔄 Task change flag updated via OnlineLora.check_task_change: {changed}")
+                # PlanWorkspace에도 현재 태스크 ID 반영 (perform_planning 등에서 사용)
+                plan_workspace.current_task_id = getattr(
+                    plan_workspace.online_learner, 'current_task_id', task_id + 1
+                )
+        except Exception as e:
+            print(f"⚠️  Failed to set task change flag: {e}")
+
+        # 🔧 앙상블 전용 모드에서 최초 적층 강제 수행 (task_based_stacking=false여도 1회 적층)
+        try:
+            if (hasattr(plan_workspace, 'online_learner') and
+                hasattr(plan_workspace.online_learner, 'hybrid_enabled') and
+                plan_workspace.online_learner.hybrid_enabled and
+                hasattr(plan_workspace.online_learner, 'task_based_stacking') and
+                not plan_workspace.online_learner.task_based_stacking and
+                hasattr(plan_workspace.online_learner, 'ensemble_manager')):
+                # cfg 플래그 확인
+                hybrid_cfg = cfg_dict.get("lora", {}).get("hybrid_stacking", {})
+                force_initial = hybrid_cfg.get("force_initial_stacking", True)
+                # 현재 앙상블 멤버 수 확인 및 최초 적층 여부 결정
+                num_members = len(plan_workspace.online_learner.ensemble_manager.ensemble_members)
+                if force_initial and num_members == 0 and getattr(plan_workspace.online_learner, 'stacks_in_current_task', 0) == 0:
+                    print(f"\n🎯 Forcing initial LoRA stacking for Task {task_id + 1} (ensemble_initial)")
+                    success = plan_workspace.online_learner.trigger_task_based_stacking(task_id + 1, "ensemble_initial")
+                    if success:
+                        task_lora_stacks += 1
+                        print(f"✅ Initial ensemble-based LoRA stacking completed. Total stacks in task: {task_lora_stacks}")
+                    else:
+                        print(f"⚠️  Initial ensemble-based LoRA stacking skipped or failed.")
+        except Exception as e:
+            print(f"⚠️  Failed to perform forced initial stacking: {e}")
+
+        # LoRA 적층 콜백 설정 (태스크 추적 + 앙상블 저장 둘 다 수행)
+        if plan_workspace.is_online_lora and hasattr(plan_workspace.online_learner, 'base_online_lora'):
+            old_cb = getattr(plan_workspace.online_learner.base_online_lora, 'on_lora_stack_callback', None)
+
+            def on_lora_stack(steps, loss, task_id, stack_type, reason):
+                # 1) 기존 콜백 호출 (앙상블 멤버 저장 등)
+                if callable(old_cb):
+                    try:
+                        old_cb(steps, loss, task_id, stack_type, reason)
+                    except Exception as e:
+                        print(f"⚠️  Error in chained base callback: {e}")
+
+                # 2) 태스크별 스택 카운트 업데이트
                 nonlocal task_lora_stacks
                 task_lora_stacks += 1
                 loss_str = f"{loss:.6f}" if loss is not None else "N/A"
-                print(f"🔥 LoRA Stack #{task_lora_stacks} at step {steps} with loss {loss_str}")
-            plan_workspace.online_learner.on_lora_stack_callback = on_lora_stack
+                print(f"🔥 LoRA Stack #{task_lora_stacks} at step {steps} (task {task_id}, type {stack_type}, reason {reason}) loss {loss_str}")
+
+            # Base OnlineLora가 호출하는 콜백을 래핑하여 교체
+            plan_workspace.online_learner.base_online_lora.on_lora_stack_callback = on_lora_stack
         
         # 태스크 변경 시 LoRA 적층 트리거 (하이브리드 모드에서만)
         if (hasattr(plan_workspace.online_learner, 'trigger_task_based_stacking') and
@@ -671,7 +1189,11 @@ def planning_main(cfg_dict):
             else:
                 print(f"⚠️  Task-based LoRA stacking skipped or failed.")
         else:
-            print(f"⚠️  Task-based LoRA stacking disabled (hybrid_enabled: {getattr(plan_workspace.online_learner, 'hybrid_enabled', False)}, task_based_stacking: {getattr(plan_workspace.online_learner, 'task_based_stacking', False)})")
+            # 🔧 앙상블 LoRA 사용 여부에 따른 메시지 출력
+            if hasattr(plan_workspace.online_learner, 'ensemble_manager'):
+                print(f"⚠️  Task-based LoRA stacking disabled (hybrid_enabled: {getattr(plan_workspace.online_learner, 'hybrid_enabled', False)}, task_based_stacking: {getattr(plan_workspace.online_learner, 'task_based_stacking', False)})")
+            else:
+                print(f"⚠️  Standard OnlineLora mode - using default LoRA stacking behavior")
 
         # 3-C. Loss 기반 태스크 전환 로직
         task_switch_config = cfg_dict.get("lora", {}).get("task_switch", {})
@@ -700,7 +1222,10 @@ def planning_main(cfg_dict):
                 current_loss = None
                 if plan_workspace.is_online_lora and hasattr(plan_workspace.online_learner, 'last_loss'):
                     current_loss = plan_workspace.online_learner.last_loss
-                    print(f"Current loss: {current_loss:.6f} (threshold: {loss_threshold})")
+                    if current_loss is not None:
+                        print(f"Current loss: {current_loss:.6f} (threshold: {loss_threshold})")
+                    else:
+                        print(f"Current loss: N/A (threshold: {loss_threshold})")
                 
                 # 로그 저장
                 log_entry_with_task = {f"task_{task_id+1}/{k}": v for k, v in logs.items()}
@@ -728,10 +1253,11 @@ def planning_main(cfg_dict):
                         break
         else:
             # 기존 방식: 고정 횟수
-            num_planning_per_task = 1
+            num_planning_per_task = 10
             for i in range(num_planning_per_task):
                 print(f"\n--- Task {task_id + 1}, Planning Step {i+1}/{num_planning_per_task} ---")
                 logs = plan_workspace.perform_planning()
+                task_planning_steps += 1
                 log_entry_with_task = {f"task_{task_id+1}/{k}": v for k, v in logs.items()}
                 overall_logs.append(log_entry_with_task)
                 if wandb_run:
@@ -748,6 +1274,17 @@ def planning_main(cfg_dict):
                 model.predictor.add_new_lora_stack()
             if hasattr(plan_workspace.online_learner, 'reset_optimizer'):
                 plan_workspace.online_learner.reset_optimizer()
+
+        # --- 태스크 종료 시 앙상블에 최종 LoRA 멤버 저장 (최종 학습 상태 반영) ---
+        try:
+            if (plan_workspace.is_online_lora and hasattr(plan_workspace, 'online_learner') and
+                hasattr(plan_workspace.online_learner, 'save_current_lora_member') and
+                getattr(plan_workspace.online_learner, 'save_on_task_end', True)):
+                current_task_for_save = getattr(plan_workspace.online_learner, 'current_task_id', task_id + 1)
+                print(f"💾 Saving finalized LoRA member for Task {current_task_for_save} at task end...")
+                plan_workspace.online_learner.save_current_lora_member(task_id=current_task_for_save, reason="task_end")
+        except Exception as e:
+            print(f"⚠️  Failed to save finalized LoRA member at task end: {e}")
 
         # 태스크 완료 요약 생성
         task_duration = time.time() - current_task_start_time
@@ -795,9 +1332,8 @@ def planning_main(cfg_dict):
             print(f"📊 Forgetting Analysis for Task {task_id + 1}:")
             for result in forgetting_results:
                 avg_loss_str = f"{result['avg_loss']:.6f}" if result['avg_loss'] is not None else "N/A"
-                target_loss = result.get('target_loss', 0.1)
                 print(f"   - Task {result['past_task_id']}: Success Rate {result['success_rate']:.3f}, "
-                      f"Loss {avg_loss_str} (Target: {target_loss}, Retention: {result['retention_rate']:.1f}%)")
+                      f"Loss {avg_loss_str}")
 
         # 리소스 정리를 위해 현재 태스크의 환경을 닫습니다.
         # env.close()  # 과거 태스크 측정을 위해 환경을 닫지 않음
@@ -810,7 +1346,16 @@ def planning_main(cfg_dict):
     print(f"{'='*60}")
     print(f"Total Tasks: {len(task_summary)}")
     print(f"Total Duration: {sum(task['duration_seconds'] for task in task_summary):.2f}s")
-    print(f"Total LoRA Stacks: {sum(task['lora_stacks'] for task in task_summary)}")
+    total_lora_stacks = sum(task['lora_stacks'] for task in task_summary)
+    # 앙상블 멤버 수를 요약에 반영
+    ensemble_member_count = 0
+    try:
+        if 'plan_workspace' in locals() and plan_workspace and hasattr(plan_workspace, 'online_learner') \
+           and hasattr(plan_workspace.online_learner, 'ensemble_manager'):
+            ensemble_member_count = len(plan_workspace.online_learner.ensemble_manager.ensemble_members)
+    except Exception:
+        ensemble_member_count = 0
+    print(f"Total LoRA Stacks: {total_lora_stacks} (Ensemble Members: {ensemble_member_count})")
     print(f"Total Planning Steps: {sum(task['planning_steps'] for task in task_summary)}")
     
     print(f"\n📋 TASK-BY-TASK BREAKDOWN:")
@@ -870,8 +1415,8 @@ def planning_main(cfg_dict):
         print(f"{'='*60}")
         
         # 전체 망각 통계
-        all_retention_rates = []
-        task_retention_summary = {}
+        all_losses = []
+        task_loss_summary = {}
         
         for task_idx, forgetting_results in enumerate(forgetting_metrics):
             current_task_id = task_idx + 2  # 첫 번째 태스크 이후부터 측정
@@ -879,44 +1424,49 @@ def planning_main(cfg_dict):
             
             for result in forgetting_results:
                 past_task_id = result['past_task_id']
-                retention_rate = result['retention_rate']
-                all_retention_rates.append(retention_rate)
+                avg_loss = result['avg_loss']
+                if avg_loss is not None and avg_loss > 0:
+                    all_losses.append(avg_loss)
                 
-                # 각 과거 태스크별 평균 유지율 계산
-                if past_task_id not in task_retention_summary:
-                    task_retention_summary[past_task_id] = []
-                task_retention_summary[past_task_id].append(retention_rate)
+                # 각 과거 태스크별 평균 loss 계산
+                if past_task_id not in task_loss_summary:
+                    task_loss_summary[past_task_id] = []
+                task_loss_summary[past_task_id].append(avg_loss)
                 
                 env_str = f"{result['env_config'].get('shape', 'N/A')}-{result['env_config'].get('color', 'N/A')}-{result['env_config'].get('background_color', 'N/A')}"
-                print(f"   Task {past_task_id} ({env_str}): {retention_rate:.1f}% retention")
+                loss_str = f"{avg_loss:.6f}" if avg_loss is not None else "N/A"
+                print(f"   Task {past_task_id} ({env_str}): Loss {loss_str}")
         
         # 전체 망각 분석
-        avg_retention = sum(all_retention_rates) / len(all_retention_rates) if all_retention_rates else 0
-        min_retention = min(all_retention_rates) if all_retention_rates else 0
-        max_retention = max(all_retention_rates) if all_retention_rates else 0
-        
-        print(f"\n🎯 OVERALL FORGETTING STATISTICS:")
-        print(f"   - Average Retention Rate: {avg_retention:.1f}%")
-        print(f"   - Minimum Retention Rate: {min_retention:.1f}%")
-        print(f"   - Maximum Retention Rate: {max_retention:.1f}%")
-        print(f"   - Total Measurements: {len(all_retention_rates)}")
-        
-        # 각 태스크별 평균 유지율
-        print(f"\n📈 TASK-SPECIFIC RETENTION RATES:")
-        for past_task_id in sorted(task_retention_summary.keys()):
-            avg_retention_for_task = sum(task_retention_summary[past_task_id]) / len(task_retention_summary[past_task_id])
-            print(f"   Task {past_task_id}: {avg_retention_for_task:.1f}% average retention")
-        
-        # 망각 심각도 평가
-        print(f"\n⚠️  FORGETTING SEVERITY ASSESSMENT:")
-        if avg_retention >= 80:
-            print(f"   🟢 LOW FORGETTING: ({avg_retention:.1f}%)")
-        elif avg_retention >= 60:
-            print(f"   🟡 MODERATE FORGETTING: ({avg_retention:.1f}%)")
-        elif avg_retention >= 40:
-            print(f"   🟠 HIGH FORGETTING: ({avg_retention:.1f}%)")
-        else:
-            print(f"   🔴 SEVERE FORGETTING: ({avg_retention:.1f}%)")
+        if all_losses:
+            avg_loss = sum(all_losses) / len(all_losses)
+            min_loss = min(all_losses)
+            max_loss = max(all_losses)
+            
+            print(f"\n🎯 OVERALL FORGETTING STATISTICS:")
+            print(f"   - Average Loss: {avg_loss:.6f}")
+            print(f"   - Minimum Loss: {min_loss:.6f}")
+            print(f"   - Maximum Loss: {max_loss:.6f}")
+            print(f"   - Total Measurements: {len(all_losses)}")
+            
+            # 각 태스크별 평균 loss
+            print(f"\n📈 TASK-SPECIFIC LOSS SUMMARY:")
+            for past_task_id in sorted(task_loss_summary.keys()):
+                valid_losses = [loss for loss in task_loss_summary[past_task_id] if loss is not None and loss > 0]
+                if valid_losses:
+                    avg_loss_for_task = sum(valid_losses) / len(valid_losses)
+                    print(f"   Task {past_task_id}: {avg_loss_for_task:.6f} average loss")
+            
+            # 망각 심각도 평가 (loss 기반)
+            print(f"\n⚠️  FORGETTING SEVERITY ASSESSMENT:")
+            if avg_loss <= 0.1:
+                print(f"   🟢 LOW FORGETTING: (Loss {avg_loss:.6f})")
+            elif avg_loss <= 0.2:
+                print(f"   🟡 MODERATE FORGETTING: (Loss {avg_loss:.6f})")
+            elif avg_loss <= 0.3:
+                print(f"   🟠 HIGH FORGETTING: (Loss {avg_loss:.6f})")
+            else:
+                print(f"   🔴 SEVERE FORGETTING: (Loss {avg_loss:.6f})")
         print(f"{'='*60}")
     
     # 환경 정리

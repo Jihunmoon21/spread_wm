@@ -66,6 +66,7 @@ class OnlineLora:
             # 태스크별 적층 추적
             self.stacks_in_current_task = 0
             self.current_task_id = 0
+            self.task_changed = False  # 태스크 전환 감지 플래그
             self.stack_history = []  # 적층 히스토리 (타입, 시점, Loss 등)
             
             if self.hybrid_enabled:
@@ -297,9 +298,15 @@ class OnlineLora:
             print(f"   - Reason: {reason}")
             print(f"   - Stacks in current task: {self.stacks_in_current_task + 1}/{self.max_stacks_per_task}")
             
-            # LoRA 적층 콜백 호출 (태스크 추적을 위해)
+            # 🔧 LoRA 적층 콜백 호출 (앙상블 저장을 위해 확장된 정보 전달)
             if self.on_lora_stack_callback:
-                self.on_lora_stack_callback(self.steps_since_last_stack, self.last_loss)
+                self.on_lora_stack_callback(
+                    steps=self.steps_since_last_stack, 
+                    loss=self.last_loss,
+                    task_id=task_id,
+                    stack_type=stack_type,
+                    reason=reason
+                )
             
             return True
             
@@ -321,3 +328,29 @@ class OnlineLora:
         self.optimizer = torch.optim.Adam(params_to_train, lr=old_lr)
         
         print(f"Optimizer reset: {len(params_to_train)} trainable parameters, lr={old_lr}")
+    
+    def check_task_change(self, new_task_id):
+        """
+        태스크 전환을 감지하고 task_changed 플래그를 설정합니다.
+        
+        Args:
+            new_task_id (int): 새로운 태스크 ID
+            
+        Returns:
+            bool: 태스크가 실제로 변경되었는지 여부
+        """
+        if not self.is_online_lora:
+            return False
+            
+        if new_task_id != self.current_task_id:
+            self.current_task_id = new_task_id
+            self.stacks_in_current_task = 0
+            self.task_changed = True
+            return True
+        else:
+            self.task_changed = False
+            return False
+    
+    def reset_task_changed_flag(self):
+        """task_changed 플래그를 리셋합니다."""
+        self.task_changed = False

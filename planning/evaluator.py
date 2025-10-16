@@ -52,7 +52,18 @@ class PlanEvaluator:  # evaluator for planning
         self.is_online_lora = self.workspace.is_online_lora if self.workspace is not None else is_online_lora
         # workspace로부터 optimizer와 loss_fn 가져오기
         if self.is_lora_enabled:
-            print(f"LoRA enabled: {self.is_lora_enabled}, Online LoRA: {self.is_online_lora}")
+            # 앙상블 사용 여부 확인 (online_learner가 있고 ensemble_manager가 있으면 True)
+            try:
+                lora_ensemble_enabled = (
+                    hasattr(self.workspace, 'online_learner') and
+                    hasattr(self.workspace.online_learner, 'ensemble_manager') and
+                    self.workspace.online_learner.ensemble_manager is not None
+                )
+            except Exception:
+                lora_ensemble_enabled = False
+            print(
+                f"LoRA enabled: {self.is_lora_enabled}, Online LoRA: {self.is_online_lora}, LoRA Ensemble: {lora_ensemble_enabled}"
+            )
             
             # LoRA 파라미터 상태 확인
             if hasattr(self.wm, 'predictor') and hasattr(self.wm.predictor, 'lora_vit'):
@@ -258,6 +269,7 @@ class PlanEvaluator:  # evaluator for planning
             e_obs=e_final_obs,
             i_z_obs=i_final_z_obs,
         )
+        
 
         # plot trajs
         if self.wm.decoder is not None:
