@@ -26,6 +26,7 @@ class MPCPlanner(BasePlanner):
         wandb_run,
         logging_prefix="mpc",
         log_filename="logs.json",
+        ensemble_manager=None,  # 🔧 앙상블 매니저 추가
         **kwargs,
     ):
         super().__init__(
@@ -56,6 +57,7 @@ class MPCPlanner(BasePlanner):
         self.action_len = None  # keep track of the step each traj reaches success
         self.iter = 0
         self.planned_actions = []
+        self.ensemble_manager = ensemble_manager  # 🔧 앙상블 매니저 저장
 
     def _apply_success_mask(self, actions):
         device = actions.device
@@ -85,6 +87,8 @@ class MPCPlanner(BasePlanner):
         memo_actions = None
         while not np.all(self.is_success) and self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
+            
+            # 🔧 MPC에서는 일반 플래닝 사용 (앙상블은 태스크 전환 시에만 사용)
             actions, _ = self.sub_planner.plan(
                 obs_0=cur_obs_0,
                 obs_g=obs_g,
@@ -143,9 +147,6 @@ class MPCPlanner(BasePlanner):
         # 최종 결과 반환
         planned_actions = torch.cat(self.planned_actions, dim=1)
         
-        print(f"[MPC FINAL] Completed {self.iter} iterations")
-        print(f"[MPC FINAL] Final success status: {self.is_success}")
-        print(f"[MPC FINAL] Total planned actions shape: {planned_actions.shape}")
         
         # 평가자를 원래 상태로 복원
         self.evaluator.assign_init_cond(
@@ -154,3 +155,4 @@ class MPCPlanner(BasePlanner):
         )
 
         return planned_actions, self.action_len
+

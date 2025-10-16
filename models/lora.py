@@ -190,8 +190,7 @@ class LoRA_ViT_spread(nn.Module):
                 print(error_msg)
                 raise AssertionError(error_msg)
             else:
-                # 성공 시 성공 로그 출력
-                print(f"[LoRA Equivalence Check PASSED] Layer {li}: Max difference is {diff} (<= {atol})")
+                pass
 
     def reset_parameters(self) -> None:
         if self.online_mode:
