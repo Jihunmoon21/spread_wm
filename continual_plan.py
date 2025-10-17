@@ -517,54 +517,6 @@ class PlanWorkspace:
         inference_cfg = ensemble_cfg.get("inference", {})
         evaluation_steps = inference_cfg.get("evaluation_steps", 5)
         
-        # 🔍 디버그: 멤버별 LoRA 가중치가 실제로 다른지 해시 지문 출력
-        try:
-            import hashlib
-
-            def _tensor_hash(tensor_obj):
-                try:
-                    arr = tensor_obj.detach().cpu().contiguous().numpy()
-                    return hashlib.sha256(arr.tobytes()).hexdigest()
-                except Exception:
-                    return "NA"
-
-            def _member_fingerprint(lora_weights, sample_layers=4):
-                if not isinstance(lora_weights, dict) or not lora_weights:
-                    return "EMPTY"
-                keys = sorted(list(lora_weights.keys()))[:sample_layers]
-                parts = []
-                for k in keys:
-                    lw = lora_weights.get(k, {})
-                    if not isinstance(lw, dict):
-                        continue
-                    w_a = lw.get('w_A', None)
-                    w_b = lw.get('w_B', None)
-                    if w_a is not None:
-                        parts.append(_tensor_hash(w_a))
-                    if w_b is not None:
-                        parts.append(_tensor_hash(w_b))
-                return "|".join(parts) if parts else "EMPTY"
-
-            fingerprints = {}
-            members = getattr(self.online_learner, 'ensemble_manager', None)
-            if members is not None and hasattr(members, 'ensemble_members'):
-                for m_task_id, m_info in members.ensemble_members.items():
-                    fp = _member_fingerprint(m_info.get('lora_weights', {}))
-                    fingerprints[m_task_id] = fp
-                    print(f"🔍 Ensemble fingerprint - Task {m_task_id}: {fp}")
-
-                # 동일 지문 그룹 검출
-                fp_groups = {}
-                for tid, fp in fingerprints.items():
-                    fp_groups.setdefault(fp, []).append(tid)
-                duplicate_groups = [grp for grp in fp_groups.values() if len(grp) > 1]
-                if duplicate_groups:
-                    print(f"⚠️ Detected identical LoRA weights across members (sampled layers): {duplicate_groups}")
-                else:
-                    print("✅ All ensemble member fingerprints differ (on sampled layers)")
-        except Exception as e:
-            print(f"⚠️ Fingerprint logging failed: {e}")
-
         member_performances = []
         
         # 현재 LoRA 상태 백업
@@ -652,7 +604,8 @@ class PlanWorkspace:
                     actions=actions,
                     action_len=None,  # evaluator.py가 자동으로 np.inf 설정
                     filename="ensemble_eval",
-                    save_video=False
+                    save_video=False,
+                    allow_online_update=False
                 )
             
             # 3. 캡처된 출력에서 loss 값 파싱
@@ -1012,20 +965,23 @@ def planning_main(cfg_dict):
     # --- ▼ 2. 연속 학습을 위한 태스크 정의 ▼ ---
     # 11개의 서로 다른 환경 설정을 정의합니다.
     task_configs = [
-        # Original (기본 설정)
-        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
+        {'shape': 'T',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
+        {'shape': 'L',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 3: A' (appearance conflict)
+        {'shape': 'L',       'color': 'Yellow',         'background_color': 'White'},  # Task 4: B (shape+color shift)
+        {'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 5: A' (appearance conflict)
+        # # Original (기본 설정)
+        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
         
         # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
         # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
-        # 블록 모양 변화
+        # # 블록 모양 변화
         # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
         # {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 2: 정사각형
 
         # {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
-        {'shape': 'L', 'color': 'LightSlateGray', 'background_color': 'White'},     # Task 4: L
-        {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
-        # {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
-        {'shape': 'L', 'color': 'LightSlateGray', 'background_color': 'White'},     # Task 4: L
+        # {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
+
         # # 블록 색상 변화
         # {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
         # {'shape': 'T', 'color': 'Yellow', 'background_color': 'White'},             # Task 8: 블록 노랑
@@ -1347,14 +1303,8 @@ def planning_main(cfg_dict):
     print(f"Total Tasks: {len(task_summary)}")
     print(f"Total Duration: {sum(task['duration_seconds'] for task in task_summary):.2f}s")
     total_lora_stacks = sum(task['lora_stacks'] for task in task_summary)
-    # 앙상블 멤버 수를 요약에 반영
-    ensemble_member_count = 0
-    try:
-        if 'plan_workspace' in locals() and plan_workspace and hasattr(plan_workspace, 'online_learner') \
-           and hasattr(plan_workspace.online_learner, 'ensemble_manager'):
-            ensemble_member_count = len(plan_workspace.online_learner.ensemble_manager.ensemble_members)
-    except Exception:
-        ensemble_member_count = 0
+    # 앙상블 멤버 수는 총 스택 수와 일치해야 함 (태스크 종료 시마다 멤버 저장)
+    ensemble_member_count = total_lora_stacks
     print(f"Total LoRA Stacks: {total_lora_stacks} (Ensemble Members: {ensemble_member_count})")
     print(f"Total Planning Steps: {sum(task['planning_steps'] for task in task_summary)}")
     

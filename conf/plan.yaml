@@ -47,6 +47,7 @@ lora:
   enabled: true
   online: true
   ensemble: true                  # ← 기존 ensemble_lora.enabled 대체
+  lr: 0.0005                    # LoRA learning rate (기본값: 1e-4)
   visual_loss_weight: 1.0
   proprio_loss_weight: 0.3
   
@@ -84,6 +85,6 @@ lora:
       stack_on_selected: true
       task_specific_evaluation: true
       evaluation_loss_threshold: 0.15
-      task_change_evaluation_steps: 5
+      task_change_evaluation_steps: 1
     consolidation_method: "best_only"
     consolidate_after_tasks: 5

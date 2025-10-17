@@ -119,7 +119,7 @@ class PlanEvaluator:  # evaluator for planning
         return result
 
     def eval_actions(
-        self, actions, action_len=None, filename="output", save_video=False
+        self, actions, action_len=None, filename="output", save_video=False, allow_online_update=True
     ):
         """
         actions: detached torch tensors on cuda
@@ -152,7 +152,8 @@ class PlanEvaluator:  # evaluator for planning
         e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions)
         # # ======================================================= #
         # LoRA 학습이 활성화된 경우, 학습 책임을 OnlineLora 객체에 위임합니다.
-        if self.is_lora_enabled and self.workspace.online_learner is not None:
+        # 앙상블 평가 등 순수평가 시에는 allow_online_update=False로 비활성화합니다.
+        if allow_online_update and self.is_lora_enabled and self.workspace.online_learner is not None:
             self.workspace.online_learner.update(trans_obs_0, actions, e_obses)
         # if self.is_lora_enabled:
         #     print("--- Starting LoRA Online Learning ---")
