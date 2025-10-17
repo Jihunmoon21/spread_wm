@@ -1112,6 +1112,13 @@ class EnsembleOnlineLora:
         if not self.save_on_task_end:
             print("ℹ️ save_on_task_end is disabled; skipping final save")
             return False
+        # 스태킹이 한 번도 발생하지 않았다면 저장하지 않음 (요청된 정책)
+        try:
+            if getattr(self, 'stacks_in_current_task', 0) == 0:
+                print("ℹ️ No LoRA stacking in current task; skipping final save at task end")
+                return False
+        except Exception as e:
+            print(f"⚠️  Could not determine stacking status: {e}")
         try:
             last_loss = getattr(self.base_online_lora, 'last_loss', None)
             steps = getattr(self.base_online_lora, 'steps_since_last_stack', 0)
@@ -1571,6 +1578,141 @@ class EnsembleOnlineLora:
         """task_changed 플래그를 리셋합니다."""
         self.base_online_lora.reset_task_changed_flag()
         self.task_changed = self.base_online_lora.task_changed
+
+    # =====================
+    # Debug/Verification Utils
+    # =====================
+
+    def _tensor_hash(self, tensor_obj) -> str:
+        """Return SHA256 hash of a tensor's CPU bytes (float32 assumed)."""
+        try:
+            import hashlib
+            arr = tensor_obj.detach().cpu().contiguous().numpy()
+            return hashlib.sha256(arr.tobytes()).hexdigest()
+        except Exception:
+            return "NA"
+
+    def _fingerprint_weights(self, lora_weights: dict, sample_layers: int = 4) -> list:
+        """Create a simple fingerprint list [hashA0, hashB0, hashA1, hashB1, ...]."""
+        if not isinstance(lora_weights, dict) or not lora_weights:
+            return []
+        keys = sorted(list(lora_weights.keys()))[:sample_layers]
+        parts = []
+        for k in keys:
+            lw = lora_weights.get(k, {})
+            if not isinstance(lw, dict):
+                continue
+            w_a = lw.get('w_A', None)
+            w_b = lw.get('w_B', None)
+            if w_a is not None:
+                parts.append(self._tensor_hash(w_a))
+            if w_b is not None:
+                parts.append(self._tensor_hash(w_b))
+        return parts
+
+    def compute_member_fingerprint(self, task_id: int, sample_layers: int = 4) -> str:
+        """Return a compact string fingerprint for a given member."""
+        if task_id not in self.ensemble_manager.ensemble_members:
+            return ""
+        lora_weights = self.ensemble_manager.ensemble_members[task_id].get('lora_weights', {})
+        parts = self._fingerprint_weights(lora_weights, sample_layers)
+        return "|".join(parts) if parts else "EMPTY"
+
+    def log_all_member_fingerprints(self, sample_layers: int = 4):
+        """Print fingerprints for all ensemble members and detect duplicates."""
+        if not self.ensemble_manager.ensemble_members:
+            print("⚠️  No ensemble members available for fingerprinting")
+            return
+        fingerprints = {}
+        for m_task_id, m_info in self.ensemble_manager.ensemble_members.items():
+            fp = self.compute_member_fingerprint(m_task_id, sample_layers)
+            fingerprints[m_task_id] = fp
+            print(f"🔍 Ensemble fingerprint - Task {m_task_id}: {fp}")
+        # duplicate groups
+        fp_groups = {}
+        for tid, fp in fingerprints.items():
+            fp_groups.setdefault(fp, []).append(tid)
+        dups = [grp for grp in fp_groups.values() if len(grp) > 1]
+        if dups:
+            print(f"⚠️  Detected identical fingerprints (sampled layers): {dups}")
+        else:
+            print("✅ All ensemble member fingerprints differ (on sampled layers)")
+
+    def verify_ensemble_save_load_integrity(self, tmp_path: str, sample_layers: int = 4) -> bool:
+        """Save ensemble to disk, reload into a fresh manager, and compare fingerprints."""
+        if not self.ensemble_manager.ensemble_members:
+            print("⚠️  No ensemble members to verify")
+            return False
+        # capture current fingerprints
+        before = {tid: self.compute_member_fingerprint(tid, sample_layers)
+                  for tid in self.ensemble_manager.ensemble_members.keys()}
+        # save
+        ok = self.ensemble_manager.save_ensemble_to_disk(tmp_path)
+        if not ok:
+            print("❌ Failed to save ensemble for integrity check")
+            return False
+        # load into a fresh manager
+        temp_mgr = LoRAEnsembleManager(
+            base_model=self.wm,
+            max_ensemble_size=self.ensemble_manager.max_ensemble_size,
+            cache_dir=self.ensemble_manager.cache_dir,
+            max_memory_mb=self.ensemble_manager.max_memory_mb,
+        )
+        ok2 = temp_mgr.load_ensemble_from_disk(tmp_path)
+        if not ok2:
+            print("❌ Failed to load ensemble for integrity check")
+            return False
+        # compare
+        after = {}
+        for tid, info in temp_mgr.ensemble_members.items():
+            lora_weights = info.get('lora_weights', {})
+            parts = self._fingerprint_weights(lora_weights, sample_layers)
+            after[tid] = "|".join(parts) if parts else "EMPTY"
+        # report
+        all_ok = True
+        for tid in before.keys():
+            b = before.get(tid, "")
+            a = after.get(tid, "")
+            same = (a == b)
+            print(f"🧪 Integrity [{tid}]: {'OK' if same else 'MISMATCH'}")
+            if not same:
+                print(f"   before: {b}")
+                print(f"   after : {a}")
+                all_ok = False
+        if all_ok:
+            print("✅ Save/Load integrity verified (fingerprints match)")
+        return all_ok
+
+    def summarize_member_differences(self, sample_layers: int = 4):
+        """Print simple differences between member weights (hash equality and L1 mean)."""
+        import itertools
+        if not self.ensemble_manager.ensemble_members:
+            print("⚠️  No ensemble members available for difference summary")
+            return
+        members = list(self.ensemble_manager.ensemble_members.items())
+        for (tid_a, a), (tid_b, b) in itertools.combinations(members, 2):
+            lw_a = a.get('lora_weights', {})
+            lw_b = b.get('lora_weights', {})
+            keys = sorted(list(set(lw_a.keys()) & set(lw_b.keys())))[:sample_layers]
+            same_hash = 0
+            total = 0
+            l1_accum = 0.0
+            for k in keys:
+                wa_a = lw_a[k]['w_A']; wb_a = lw_a[k]['w_B']
+                wa_b = lw_b[k]['w_A']; wb_b = lw_b[k]['w_B']
+                ha = (self._tensor_hash(wa_a), self._tensor_hash(wb_a))
+                hb = (self._tensor_hash(wa_b), self._tensor_hash(wb_b))
+                same_hash += int(ha == hb)
+                total += 1
+                try:
+                    import torch
+                    l1_accum += torch.mean(torch.abs(wa_a.detach().cpu() - wa_b.detach().cpu())).item()
+                    l1_accum += torch.mean(torch.abs(wb_a.detach().cpu() - wb_b.detach().cpu())).item()
+                except Exception:
+                    pass
+            hash_eq_ratio = (same_hash / total) if total else 0.0
+            avg_l1 = (l1_accum / (2 * total)) if total else 0.0
+            print(f"🔎 Diff Task {tid_a} vs {tid_b}: hash_eq_ratio={hash_eq_ratio:.2f}, avg_L1={avg_l1:.6f}")
     
     def _apply_lora_weights(self, lora_weights):
         """
