@@ -351,7 +351,7 @@ class PlanWorkspace:
             actions=actions_init,
         )
         logs, successes, _, _ = self.evaluator.eval_actions(
-            actions.detach(), action_len, save_video=True, filename="output_final", allow_online_update=True
+            actions.detach(), action_len, save_video=True, filename="output_final"
         )
         logs = {f"final_eval/{k}": v for k, v in logs.items()}
         self.wandb_run.log(logs)

@@ -55,7 +55,7 @@ lora:
   task_switch:
     enabled: true
     loss_threshold: 0.10          # 최근 윈도우 평균 손실이 이 값 이하로 수렴하면 전환
-    max_planning_per_task: 1000     # 태스크당 최대 플래닝 반복 횟수
+    max_planning_per_task: 300     # 태스크당 최대 플래닝 반복 횟수
     min_planning_per_task: 5      # 최소 플래닝 반복 후부터 전환 조건 평가
     loss_window_size: 3           # 전환 판단에 사용할 최근 loss 윈도우 크기
   
@@ -71,7 +71,7 @@ lora:
   # 앙상블 상세 설정(구 ensemble_lora → lora.ensemble_cfg)
   ensemble_cfg:
     max_ensemble_size: 11
-    evaluation_steps: 5
+    evaluation_steps: 1
     cache_dir: "./lora_cache"
     max_memory_mb: 200
     inference:

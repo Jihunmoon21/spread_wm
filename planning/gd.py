@@ -110,7 +110,7 @@ class GDPlanner(BasePlanner):
             )
             if self.evaluator is not None and i % self.eval_every == 0:
                 logs, successes, _, _ = self.evaluator.eval_actions(
-                    actions.detach(), filename=f"{self.logging_prefix}_output_{i+1}", allow_online_update=True
+                    actions.detach(), filename=f"{self.logging_prefix}_output_{i+1}"
                 )
                 logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}
                 logs.update({"step": i + 1})
