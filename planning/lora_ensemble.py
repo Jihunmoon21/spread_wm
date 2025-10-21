@@ -1,4 +1,6 @@
 import torch
+import torch.nn as nn
+import math
 import time
 import os
 import gzip
@@ -627,11 +629,24 @@ class EnsembleOnlineLora:
                 layers_per_stack = 12  # 각 LoRA 스택당 레이어 수
                 
                 # 첫 번째 스택 (모든 적층 효과가 포함된 레이어들) 추출
+                # 🔧 w + wnew를 추출하여 실제 사용되는 가중치 저장
+                wnew_As = getattr(self.wm.predictor, 'wnew_As', [])
+                wnew_Bs = getattr(self.wm.predictor, 'wnew_Bs', [])
+                
                 for i in range(min(layers_per_stack, len(w_As))):
                     layer_key = f'layer_{i}'
+                    
+                    # w + wnew 계산 (실제 사용되는 가중치)
+                    w_A_combined = w_As[i].weight.data.clone().detach()
+                    w_B_combined = w_Bs[i].weight.data.clone().detach()
+                    
+                    if i < len(wnew_As) and i < len(wnew_Bs):
+                        w_A_combined += wnew_As[i].weight.data.clone().detach()
+                        w_B_combined += wnew_Bs[i].weight.data.clone().detach()
+                    
                     lora_weights[layer_key] = {
-                        'w_A': w_As[i].weight.data.clone().detach(),  # 모든 적층 효과 포함
-                        'w_B': w_Bs[i].weight.data.clone().detach()   # 모든 적층 효과 포함
+                        'w_A': w_A_combined,  # w + wnew (실제 사용되는 가중치)
+                        'w_B': w_B_combined   # w + wnew (실제 사용되는 가중치)
                     }
                 
                 print(f"✅ Successfully extracted {len(lora_weights)} LoRA layers with all stacking effects")
@@ -809,6 +824,16 @@ class EnsembleOnlineLora:
         if not current_weights:
             print("⚠️ No LoRA weights extracted. Skipping save.")
             return False
+        
+        # 🔧 저장 시점 fingerprint 계산 및 출력
+        try:
+            fingerprint_parts = self._fingerprint_weights(current_weights, sample_layers=4)
+            fingerprint = "|".join(fingerprint_parts) if fingerprint_parts else "EMPTY"
+            print(f"🧬 Save-time fingerprint for Task {task_id}: {fingerprint}")
+        except Exception as e:
+            print(f"⚠️ Could not compute save-time fingerprint: {e}")
+            fingerprint = None
+        
         performance = {
             'loss': float(loss_value) if loss_value is not None else float('inf'),
             'steps': int(steps) if steps is not None else 0,
@@ -817,6 +842,7 @@ class EnsembleOnlineLora:
         metadata = {
             'reason': reason,
             'saved_at': time.time(),
+            'fingerprint': fingerprint,  # 🔧 fingerprint 저장
         }
         saved = self.ensemble_manager.add_ensemble_member(
             task_id=task_id,
@@ -1198,6 +1224,21 @@ class EnsembleOnlineLora:
             try:
                 print(f"📊 Evaluating member Task {task_id} for new task...")
                 
+                # 🔧 각 멤버 평가 전에 완전히 초기 상태로 리셋 (이전 멤버 영향 완전 제거)
+                if hasattr(self.wm.predictor, 'w_As') and hasattr(self.wm.predictor, 'w_Bs'):
+                    for w_A in self.wm.predictor.w_As:
+                        nn.init.zeros_(w_A.weight)
+                    for w_B in self.wm.predictor.w_Bs:
+                        nn.init.zeros_(w_B.weight)
+                
+                if hasattr(self.wm.predictor, 'wnew_As') and hasattr(self.wm.predictor, 'wnew_Bs'):
+                    for wnew_A in self.wm.predictor.wnew_As:
+                        nn.init.zeros_(wnew_A.weight)
+                    for wnew_B in self.wm.predictor.wnew_Bs:
+                        nn.init.zeros_(wnew_B.weight)
+                
+                print(f"🔧 Reset all LoRA weights (w, wnew) to zeros before loading ensemble member {task_id}")
+                
                 # 해당 멤버의 LoRA 가중치를 모델에 적용
                 lora_weights = member_info['lora_weights']
                 # 로드 전후 지문 비교를 위한 저장 시점 fingerprint 가져오기(있다면)
@@ -1213,15 +1254,22 @@ class EnsembleOnlineLora:
                 if not success:
                     print(f"❌ Failed to apply LoRA weights for member {task_id}")
                     continue
-                # 적용 후 현재 모델 첫 스택 지문 계산
+                # 적용 후 현재 모델 첫 스택 지문 계산 및 대조 확인
                 try:
                     applied_weights = self._extract_current_stacked_lora_weights()
                     applied_fp_parts = self._fingerprint_weights(applied_weights, sample_layers=4)
                     applied_fp = "|".join(applied_fp_parts) if applied_fp_parts else "EMPTY"
+                    
                     if saved_fp:
-                        print(f"🧬 Load-time fingerprint (sampled): {applied_fp} | saved: {saved_fp} | match: {applied_fp == saved_fp}")
+                        match_status = "✅ MATCH" if applied_fp == saved_fp else "❌ MISMATCH"
+                        print(f"🧬 Load-time fingerprint (sampled): {applied_fp}")
+                        print(f"🧬 Saved-time fingerprint (sampled): {saved_fp}")
+                        print(f"🔍 Fingerprint comparison: {match_status}")
+                        if applied_fp != saved_fp:
+                            print(f"⚠️  WARNING: Task {task_id} fingerprint mismatch detected!")
                     else:
                         print(f"🧬 Load-time fingerprint (sampled): {applied_fp}")
+                        print(f"⚠️  No saved fingerprint available for Task {task_id}")
                 except Exception as e:
                     print(f"⚠️  Could not compute load-time fingerprint: {e}")
                 

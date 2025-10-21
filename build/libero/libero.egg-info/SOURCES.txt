@@ -1,0 +1,9 @@
+LICENSE
+README.md
+setup.py
+../build/libero/libero.egg-info/PKG-INFO
+../build/libero/libero.egg-info/SOURCES.txt
+../build/libero/libero.egg-info/dependency_links.txt
+../build/libero/libero.egg-info/eager_resources.txt
+../build/libero/libero.egg-info/entry_points.txt
+../build/libero/libero.egg-info/top_level.txt

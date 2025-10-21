@@ -267,7 +267,7 @@ class VWorldModel(nn.Module):
             loss_components["decoder_loss_reconstructed"] = (
                 decoder_loss_reconstructed
             )
-            loss = loss + decoder_loss_reconstructed
+            loss = loss # + decoder_loss_reconstructed
         else:
             visual_reconstructed = None
         loss_components["loss"] = loss

@@ -1,0 +1,9 @@
+source;share/libero/hook/path.ps1
+source;share/libero/hook/path.dsv
+source;share/libero/hook/path.sh
+source;share/libero/hook/pythonpath.ps1
+source;share/libero/hook/pythonpath.dsv
+source;share/libero/hook/pythonpath.sh
+source;share/libero/hook/pythonscriptspath.ps1
+source;share/libero/hook/pythonscriptspath.dsv
+source;share/libero/hook/pythonscriptspath.sh

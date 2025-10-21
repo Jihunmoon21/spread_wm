@@ -140,7 +140,8 @@ class PlanWorkspace:
         self.current_task_id = current_task_id  # 현재 태스크 ID 저장
         self.device = next(wm.parameters()).device
         
-        self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
+        # 🔧 시드를 고정된 값으로 설정 (재현성 보장)
+        self.eval_seed = [42] * cfg_dict["n_evals"]  # 모든 평가에서 동일한 시드 사용
         print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
@@ -620,10 +621,11 @@ def planning_main(cfg_dict):
     # --- ▼ 2. 연속 학습을 위한 태스크 정의 ▼ ---
     # 11개의 서로 다른 환경 설정을 정의합니다.
     task_configs = [
-        # {'shape': 'T',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
-        {'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
+        {'shape': 'T',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
+        #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
+        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
         {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
+        #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
         #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
         #{'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 3: A' (appearance conflict)
         #{'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 5: A' (appearance conflict)
@@ -633,7 +635,8 @@ def planning_main(cfg_dict):
         # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
         # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
         # # 블록 모양 변화
-        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
+        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
+        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
         # {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 2: 정사각형
 
         # {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
@@ -910,6 +913,12 @@ def planning_main(cfg_dict):
             if (plan_workspace.is_online_lora and hasattr(plan_workspace, 'online_learner') and
                 hasattr(plan_workspace.online_learner, 'save_current_lora_member') and
                 getattr(plan_workspace.online_learner, 'save_on_task_end', True)):
+                
+                # 🔧 태스크 완료 시 w에 wnew 누적 (누락된 부분!)
+                if hasattr(plan_workspace.online_learner, 'update_and_reset_lora_parameters'):
+                    plan_workspace.online_learner.update_and_reset_lora_parameters()
+                    print(f"🔄 Updated w with wnew for Task {task_id + 1}")
+                
                 current_task_for_save = getattr(plan_workspace.online_learner, 'current_task_id', task_id + 1)
                 print(f"💾 Saving finalized LoRA member for Task {current_task_for_save} at task end...")
                 plan_workspace.online_learner.save_current_lora_member(task_id=current_task_for_save, reason="task_end")
