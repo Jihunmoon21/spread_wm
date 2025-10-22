@@ -625,6 +625,12 @@ def planning_main(cfg_dict):
         #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
         #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
         {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
+        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
         #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
         #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
         #{'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 3: A' (appearance conflict)
