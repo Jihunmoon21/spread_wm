@@ -820,6 +820,11 @@ class EnsembleOnlineLora:
             return False
 
     def _save_current_lora_member_impl(self, task_id: int, reason: str, loss_value: float, steps: int) -> bool:
+        # 🔧 적층 없이 멤버를 사용 중이면 저장하지 않음
+        if getattr(self, 'using_member_without_stacking', False):
+            print(f"ℹ️  Using member without stacking - skipping ensemble save for Task {task_id}")
+            return False
+        
         current_weights = self._extract_current_stacked_lora_weights()
         if not current_weights:
             print("⚠️ No LoRA weights extracted. Skipping save.")
@@ -880,6 +885,13 @@ class EnsembleOnlineLora:
         self.current_task_id = self.base_online_lora.current_task_id
         self.stacks_in_current_task = self.base_online_lora.stacks_in_current_task
         self.last_loss = self.base_online_lora.last_loss
+        
+        # 🔧 태스크가 변경되면 using_member_without_stacking 플래그 리셋
+        if task_changed:
+            if hasattr(self, 'using_member_without_stacking'):
+                print(f"🔄 Task changed - resetting using_member_without_stacking flag")
+                self.using_member_without_stacking = False
+                self.base_member_task_id = None
         
         return task_changed
     
@@ -1404,6 +1416,7 @@ class EnsembleOnlineLora:
     def apply_best_member_without_stacking(self, best_member_task_id):
         """
         최적 멤버를 현재 모델에 적용하되 새로운 LoRA 적층은 하지 않음
+        wnew는 0으로 초기화하여 온라인 학습은 가능하게 함 (단, 앙상블 멤버로 저장하지 않음)
         
         Args:
             best_member_task_id: 최적 멤버의 task_id
@@ -1419,8 +1432,21 @@ class EnsembleOnlineLora:
                 success = self._apply_lora_weights(lora_weights)
                 
                 if success:
+                    # 🔧 wnew를 0으로 초기화하여 온라인 학습 가능하게 함
+                    if hasattr(self.wm.predictor, 'wnew_As') and hasattr(self.wm.predictor, 'wnew_Bs'):
+                        import torch.nn as nn
+                        for wnew_A in self.wm.predictor.wnew_As:
+                            nn.init.zeros_(wnew_A.weight)
+                        for wnew_B in self.wm.predictor.wnew_Bs:
+                            nn.init.zeros_(wnew_B.weight)
+                        print(f"🔧 Initialized wnew to zeros - online learning enabled without stacking")
+                    
+                    # 🔧 적층 없이 사용 중임을 플래그로 표시 (앙상블 저장 방지)
+                    self.using_member_without_stacking = True
+                    self.base_member_task_id = best_member_task_id
+                    
                     print(f"✅ Successfully applied best member's LoRA weights without stacking")
-                    print(f"🎯 Using best member directly for new task")
+                    print(f"🎯 Using best member directly for new task (online learning enabled)")
                 else:
                     print(f"❌ Failed to apply best member's LoRA weights")
             else:
