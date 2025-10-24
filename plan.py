@@ -376,7 +376,11 @@ def load_ckpt(snapshot_path, device):
     for k, v in payload.items():
         if k in ALL_MODEL_KEYS:
             loaded_keys.append(k)
-            result[k] = v.to(device)
+            # None 체크 추가 (dummy checkpoint 지원)
+            if v is not None:
+                result[k] = v.to(device)
+            else:
+                result[k] = None
     result["epoch"] = payload["epoch"]
     return result
 

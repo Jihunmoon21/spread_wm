@@ -32,3 +32,10 @@ register(
     max_episode_steps=300,
     reward_threshold=1.0,
 )
+
+register(
+    id="libero",
+    entry_point="env.libero.libero_wrapper:LiberoWrapper",
+    max_episode_steps=1000,
+    reward_threshold=1.0,
+)

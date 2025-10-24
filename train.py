@@ -22,6 +22,7 @@ from datetime import timedelta
 from concurrent.futures import ThreadPoolExecutor
 from metrics.image_metrics import eval_images
 from utils import slice_trajdict_with_t, cfg_to_dict, seed, sample_tensors
+import custom_resolvers
 
 warnings.filterwarnings("ignore")
 log = logging.getLogger(__name__)
@@ -219,7 +220,7 @@ class Trainer:
 
         self.proprio_encoder = hydra.utils.instantiate(
             self.cfg.proprio_encoder,
-            in_chans=self.datasets["train"].proprio_dim,
+            in_chans=self.datasets["train"].dataset.proprio_dim,
             emb_dim=self.cfg.proprio_emb_dim,
         )
         proprio_emb_dim = self.proprio_encoder.emb_dim
@@ -228,7 +229,7 @@ class Trainer:
 
         self.action_encoder = hydra.utils.instantiate(
             self.cfg.action_encoder,
-            in_chans=self.datasets["train"].action_dim,
+            in_chans=self.datasets["train"].dataset.action_dim,
             emb_dim=self.cfg.action_emb_dim,
         )
         action_emb_dim = self.action_encoder.emb_dim
@@ -448,7 +449,7 @@ class Trainer:
         for i, data in enumerate(
             tqdm(self.dataloaders["train"], desc=f"Epoch {self.epoch} Train")
         ):
-            obs, act, state = data
+            obs, act, state, _ = data
             plot = i == 0  # only plot from the first batch
             self.model.train()
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
@@ -553,7 +554,7 @@ class Trainer:
                     f"train_{k}": [v] for k, v in train_rollout_logs.items()
                 }
                 self.logs_update(train_rollout_logs)
-                val_rollout_logs = self.openloop_rollout(self.val_traj_dset, mode="val")
+                # val_rollout_logs = self.openloop_rollout(self.val_traj_dset, mode="val")
                 val_rollout_logs = {
                     f"val_{k}": [v] for k, v in val_rollout_logs.items()
                 }
@@ -563,7 +564,7 @@ class Trainer:
         for i, data in enumerate(
             tqdm(self.dataloaders["valid"], desc=f"Epoch {self.epoch} Valid")
         ):
-            obs, act, state = data
+            obs, act, state, _ = data
             plot = i == 0
             self.model.eval()
             z_out, visual_out, visual_reconstructed, loss, loss_components = self.model(
@@ -818,7 +819,6 @@ class Trainer:
             normalize=True,
             value_range=(-1, 1),
         )
-
 
 @hydra.main(config_path="conf", config_name="train")
 def main(cfg: OmegaConf):

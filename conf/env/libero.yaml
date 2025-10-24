@@ -1,0 +1,23 @@
+name: libero
+args: []
+kwargs:
+  task_name: pick_up_the_bbq_sauce_and_place_it_in_the_basket
+  task_suite_name: libero_object
+  libero_pkl_path: /home/jihun/spread/assets/libero.pkl
+  camera_name: agentview
+  img_size: 256
+
+dataset:
+  _target_: "datasets.libero_dset.load_libero_slice_train_val"
+  data_path: /home/jihun/LIBERO/libero/datasets_processed/libero_object # libero 데이터셋 절대 경로
+  train_fraction: 0.9
+  random_seed: 42
+  num_frames: ${addn:${num_hist},${num_pred}}
+  frameskip: ${frameskip}
+  main_view: 'third_image' # hdf5 파일에 있는 뷰 이름으로
+  transform:
+    _target_: "datasets.img_transforms.default_transform"
+    img_size: ${img_size}
+
+decoder_path: null
+num_workers: 0

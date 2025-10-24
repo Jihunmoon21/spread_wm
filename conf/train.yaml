@@ -32,7 +32,7 @@ hydra:
 training:
   seed: 0
   epochs: 100
-  batch_size: 4 # should >= nodes * tasks_per_node
+  batch_size: 16 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
@@ -67,7 +67,7 @@ model:
   num_pred: ${num_pred}
   train_encoder: False
   train_predictor: True
-  train_decoder: True
+  train_decoder: False
 
 debug: False
 
@@ -83,4 +83,5 @@ plan_settings:
 lora:
   enabled: false # LoRA 자체를 사용할지 여부
   online: false   # LoRA 사용 시, 온라인 모드를 쓸지 여부 (false면 일반 LoRA)
-  rank: 4        # LoRA의 rank
+  ensemble: false
+  rank: 8        # LoRA의 rank
