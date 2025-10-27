@@ -24,22 +24,42 @@ hydra:
 
 # model to load for planning
 ckpt_base_path: /home/jihoonmun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: libero_dummy
+# [CHANGEME] ★★★ 학습된 LIBERO 월드 모델 이름으로 변경하세요 ★★★
+model_name: CHANGEME_LIBERO_MODEL_NAME 
 model_epoch: latest
 
 seed: 99
 n_evals: 10 # 25
-goal_source: 'random_state' # 'random_state' or 'dset' or 'random_action'
-goal_H: 5 # specifies how far away the goal is if goal_source is 'dset'
-n_plot_samples: 10
 
+# --- 수정된 부분: Goal Source 설정 ---
+goal_source: 'trajectory' # 'random_state', 'dset', 'random_action' 대신 'trajectory' 사용
+goal_H: 5 # 'dset'에서 사용되던 파라미터. 'trajectory' 모드에서는 사용되지 않을 수 있음
+
+# --- 추가된 부분: Trajectory Goal 설정 ---
+goal_traj_index: 0    # 플래닝에 사용할 LIBERO 데모 궤적의 인덱스
+goal_frame_indices: [-1] # 목표로 사용할 프레임 인덱스 ([-1] = 마지막 프레임만 사용)
+# ------------------------------------
+
+n_plot_samples: 10
 debug_dset_init: False
 
+# --- 수정된 부분: Objective 함수 설정 ---
 objective:
-  _target_: planning.objectives.create_objective_fn
-  alpha: 1
-  base: 2 # coeff base for weighting all frames. Only applies when mode == 'all'
-  mode: last
+  # 새로 정의한 궤적 기반 목표 함수 (create_trajectory_objective_fn)
+  _target_: planning.objectives.create_trajectory_objective_fn
+  
+  # 시각적 목표(visual)에 대한 가중치 (lora.visual_loss_weight와 맞춤)
+  alpha: 1.0
+  
+  # 관절 상태(proprio) 목표에 대한 가중치 (lora.proprio_loss_weight와 맞춤)
+  proprio_weight: 0.3
+  
+  # goal_frame_indices에서 정의한 값을 사용
+  goal_indices: ${goal_frame_indices}
+  
+  # "last_predicted": 예측된 궤적의 *마지막* 상태와 목표 프레임(들)을 비교
+  comparison_mode: "last_predicted" 
+# -----------------------------------
 
 
 # 앙상블 기반 LoRA 설정 (lora.*로 통합)
@@ -102,7 +122,9 @@ env:
   task_suite_name: libero_object  # 예: "libero_spatial" 또는 "libero_10"
   
   # [필수] 실행할 태스크의 전체 이름
-  task_name: pick_up_the_bbq_sauce_and_place_it_in_the_basket         # 예: "libero_spatial.move_the_block_to_the_corner_of_the_table"
+  # ★★★ 중요: 이 task_name은 위에서 설정한 goal_traj_index (예: 0)에 
+  # 해당하는 태스크와 일치해야 합니다. (plan.py에서 동적으로 로드하지 않는 경우)
+  task_name: pick_up_the_bbq_sauce_and_place_it_in_the_basket
 
   # LBP/OpenVLA 표준을 따르기 위해 256으로 설정
   img_size: 256

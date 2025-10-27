@@ -64,6 +64,7 @@ class CEMPlanner(BasePlanner):
     def plan(self, obs_0, obs_g, actions=None):
         """
         Args:
+            obs_g: This is the obs_g_traj mentioned in the prompt.
             actions: normalized
         Returns:
             actions: (B, T, action_dim) torch.Tensor, T <= self.horizon
@@ -78,7 +79,11 @@ class CEMPlanner(BasePlanner):
         trans_obs_g = move_to_device(
             self.preprocessor.transform_obs(obs_g), self.device
         )
-        z_obs_g = self.wm.encode_obs(trans_obs_g)
+        
+        # --- 수정된 부분 1: obs_g_traj를 미리 인코딩 ---
+        # plan.py로부터 전달받은 obs_g(obs_g_traj)를 월드 모델 인코더로 변환
+        z_obs_g_traj = self.wm.encode_obs(trans_obs_g)
+        # ------------------------------------------
 
         mu, sigma = self.init_mu_sigma(obs_0, actions)
         mu, sigma = mu.to(self.device), sigma.to(self.device)
@@ -95,12 +100,16 @@ class CEMPlanner(BasePlanner):
                     )
                     for key, arr in trans_obs_0.items()
                 }
-                cur_z_obs_g = {
+                
+                # --- 수정된 부분 2: 미리 인코딩된 z_obs_g_traj 사용 ---
+                cur_z_obs_g_traj = {
                     key: repeat(
                         arr[traj].unsqueeze(0), "1 ... -> n ...", n=self.num_samples
                     )
-                    for key, arr in z_obs_g.items()
+                    for key, arr in z_obs_g_traj.items() # 기존 z_obs_g 대신 z_obs_g_traj 사용
                 }
+                # -----------------------------------------------
+                
                 action = (
                     torch.randn(self.num_samples, self.horizon, self.action_dim).to(
                         self.device
@@ -115,7 +124,10 @@ class CEMPlanner(BasePlanner):
                         act=action,
                     )
 
-                loss = self.objective_fn(i_z_obses, cur_z_obs_g)
+                # --- 수정된 부분 3: objective_fn에 cur_z_obs_g_traj 전달 ---
+                loss = self.objective_fn(i_z_obses, cur_z_obs_g_traj) # 기존 cur_z_obs_g 대신 cur_z_obs_g_traj 사용
+                # ----------------------------------------------------
+
                 topk_idx = torch.argsort(loss)[: self.topk]
                 topk_action = action[topk_idx]
                 losses.append(loss[topk_idx[0]].item())
