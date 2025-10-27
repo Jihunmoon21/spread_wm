@@ -15,7 +15,7 @@ from models.vit import ViTPredictor
 from models.vqvae import VQVAE
 
 # 디렉토리 생성
-output_dir = Path("/home/jihun/spread/outputs/libero_dummy/checkpoints")
+output_dir = Path("/home/jihoonmun/spread/outputs/libero_dummy/checkpoints")
 output_dir.mkdir(parents=True, exist_ok=True)
 
 print("Creating dummy checkpoint for libero planning test...")

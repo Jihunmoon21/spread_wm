@@ -23,7 +23,7 @@ hydra:
             "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
 # model to load for planning
-ckpt_base_path: /home/jihun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+ckpt_base_path: /home/jihoonmun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: libero_dummy
 model_epoch: latest
 
@@ -96,7 +96,7 @@ env:
   _target_: env.libero.libero_wrapper.LiberoWrapper
 
   # [필수] LBP 프로젝트의 'assets/libero.pkl' 파일 절대 경로
-  libero_pkl_path: /home/jihun/spread/assets/libero.pkl
+  libero_pkl_path: /home/jihoonmun/spread/assets/libero.pkl
 
   # [필수] 실행할 태스크 스위트 (libero.pkl 내부 키와 일치해야 함)
   task_suite_name: libero_object  # 예: "libero_spatial" 또는 "libero_10"

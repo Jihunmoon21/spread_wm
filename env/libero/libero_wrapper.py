@@ -139,7 +139,7 @@ class LiberoWrapper(gym.Env):
         
         # LIBERO 버그들을 우회하는 수정사항 적용
         kwargs = self._apply_libero_fixes(env_class, {
-            "robots": "Panda",
+            "robots": ["Panda"],  # 리스트 형태로 수정하여 단일 로봇 명시
             "controller_configs": controller_config,
             "has_renderer": False,
             "has_offscreen_renderer": True,
@@ -180,12 +180,25 @@ class LiberoWrapper(gym.Env):
         ROBOT_CLASS_MAPPING.update({
             "MountedPanda": SingleArm,
             "OnTheGroundPanda": SingleArm,
-            "OnTheGroundP": SingleArm,  # 잘린 이름도 추가
+            "OnTheGroundP": SingleArm,
+            "OnTheGrounda": SingleArm,
+            "OnTheGroundn": SingleArm,  # 잘린 이름도 추가
+            "OnTheGroundd": SingleArm,
             "OnTheGroundOnTheGroundPanda": SingleArm,  # 중복 변환된 이름도 추가
         })
 
     def _fix_robot_name_conversion(self, env_class, kwargs):
         """로봇 이름 변환 이슈를 우회 - LIBERO의 변환 로직을 완전히 우회"""
+        # robots 파라미터가 있으면 올바른 형태로 보장
+        if "robots" in kwargs:
+            robots = kwargs["robots"]
+            if isinstance(robots, str):
+                # 문자열인 경우 리스트로 변환
+                kwargs["robots"] = [robots]
+            elif isinstance(robots, list) and len(robots) > 1:
+                # 여러 로봇이 있는 경우 첫 번째만 사용
+                kwargs["robots"] = [robots[0]]
+        
         # floor_manipulation의 경우 원본 Panda 이름을 그대로 사용
         # (libero_floor_manipulation.py에서 변환 로직을 비활성화했으므로)
         return kwargs

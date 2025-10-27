@@ -17,12 +17,12 @@ for data_name in data_names:
     # --- 사용자 환경에 맞게 경로 수정 ---
     # base_dir: 변환할 원본 LIBERO 데이터셋 폴더 경로 (256x256 해상도 권장)
     # 예시: '/path/to/original/libero_datasets/256/'
-    base_dir = f'/home/jihun/LIBERO/libero/datasets/{data_name}'
+    base_dir = f'/home/jihoonmun/LIBERO/libero/datasets/{data_name}'
 
     # save_base_dir: 변환된 LBP 형식 HDF5 파일을 저장할 상위 폴더 경로
     # 예시: '/path/to/save/processed_libero_datasets/'
     # 각 data_name 별 하위 폴더는 스크립트가 생성함
-    save_base_dir_root = '/home/jihun/LIBERO/libero/datasets_processed'
+    save_base_dir_root = '/home/jihoonmun/LIBERO/libero/datasets_processed'
     save_base_dir = os.path.join(save_base_dir_root, data_name) # 데이터셋별 저장 폴더
     # --- 경로 수정 끝 ---
 

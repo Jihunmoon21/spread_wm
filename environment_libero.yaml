@@ -98,7 +98,7 @@ dependencies:
       - fasteners==0.19
       - fastjsonschema==2.19.1
       - filelock==3.14.0
-      - flash-attn==2.8.3
+      # - flash-attn==2.8.3
       - flatbuffers==24.3.25
       - flax==0.7.5
       - fonttools==4.53.0
@@ -289,4 +289,4 @@ dependencies:
       - wrapt==1.14.1
       - yapf==0.43.0
       - zipp==3.19.1
-prefix: /home/jihun/miniconda3/envs/spread
+prefix: /home/jihoonmun/miniconda3/envs/spread

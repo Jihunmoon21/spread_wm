@@ -3,13 +3,13 @@ args: []
 kwargs:
   task_name: pick_up_the_bbq_sauce_and_place_it_in_the_basket
   task_suite_name: libero_object
-  libero_pkl_path: /home/jihun/spread/assets/libero.pkl
+  libero_pkl_path: /home/jihoonmun/spread/assets/libero.pkl
   camera_name: agentview
   img_size: 256
 
 dataset:
   _target_: "datasets.libero_dset.load_libero_slice_train_val"
-  data_path: /home/jihun/LIBERO/libero/datasets_processed/libero_object # libero 데이터셋 절대 경로
+  data_path: /home/jihoonmun/LIBERO/libero/datasets_processed/libero_goal # libero 데이터셋 절대 경로
   train_fraction: 0.9
   random_seed: 42
   num_frames: ${addn:${num_hist},${num_pred}}
@@ -20,4 +20,4 @@ dataset:
     img_size: ${img_size}
 
 decoder_path: null
-num_workers: 0
+num_workers: 4
