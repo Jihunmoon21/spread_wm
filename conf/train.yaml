@@ -32,7 +32,7 @@ hydra:
 training:
   seed: 0
   epochs: 100
-  batch_size: 16 # should >= nodes * tasks_per_node
+  batch_size: 12 # should >= nodes * tasks_per_node
   save_every_x_epoch: 1
   reconstruct_every_x_batch: 500
   num_reconstruct_samples: 6
@@ -41,19 +41,19 @@ training:
   predictor_lr: 5e-4
   action_encoder_lr: 5e-4
 
-img_size: 224 # should be a multiple of 224
-frameskip: 5
+img_size: 256 # should be a multiple of 224
+frameskip: 3  # 🔧 5 → 3로 변경
 concat_dim: 1
 
 normalize_action: True
 
 # action encoder
 action_emb_dim: 10
-num_action_repeat: 1
+num_action_repeat: 1  # frameskip과 같은 값이어야 함
 
 # proprio encoder
 proprio_emb_dim: 10 
-num_proprio_repeat: 1
+num_proprio_repeat: 1  # frameskip과 같은 값 (1)
 
 num_hist: 3
 num_pred: 1 # only supports 1

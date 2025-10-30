@@ -215,6 +215,18 @@ def _worker(
     env_fn_wrapper: CloudpickleWrapper,
     obs_bufs: Optional[Union[dict, tuple, ShArray]] = None,
 ) -> None:
+    # Worker 프로세스에서 경고 숨김 및 렌더링 설정
+    import warnings
+    import logging
+    import os
+    warnings.filterwarnings("ignore")
+    os.environ["PYTHONWARNINGS"] = "ignore"
+    logging.getLogger("OpenGL.acceleratesupport").setLevel(logging.ERROR)
+    logging.getLogger("robosuite_logs").setLevel(logging.ERROR)
+    os.environ["ROBOSUITE_NO_MACRO_WARNING"] = "1"
+    # MuJoCo offscreen 렌더링 설정
+    os.environ["MUJOCO_GL"] = "egl"
+    
     def _encode_obs(
         obs: Union[dict, tuple, np.ndarray], buffer: Union[dict, tuple, ShArray]
     ) -> None:
@@ -879,10 +891,19 @@ class BaseVectorEnv(object):
                 result.append(env_return)
         else:
             raise NotImplementedError
-        obses, states = tuple(zip(*result))
-        obses = aggregate_dct(obses)
-        states = np.stack(states)
-        return obses, states
+        # rollout이 3개 값을 반환하는지 확인 (obses, states, infos)
+        if len(result[0]) == 3:
+            obses, states, infos = tuple(zip(*result))
+            obses = aggregate_dct(obses)
+            states = np.stack(states)
+            infos = aggregate_dct(infos)
+            return obses, states, infos
+        else:
+            # 이전 버전 호환 (infos 없음)
+            obses, states = tuple(zip(*result))
+            obses = aggregate_dct(obses)
+            states = np.stack(states)
+            return obses, states
     
     def prepare(self, seeds, init_states):
         self._assert_is_not_closed()

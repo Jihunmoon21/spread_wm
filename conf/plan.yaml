@@ -44,9 +44,9 @@ objective:
 
 # 앙상블 기반 LoRA 설정 (lora.*로 통합)
 lora:
-  enabled: true
-  online: true
-  ensemble: true                  # ← 기존 ensemble_lora.enabled 대체
+  enabled: false
+  online: false
+  ensemble: false                  # ← 기존 ensemble_lora.enabled 대체
   lr: 0.0005                    # LoRA learning rate (기본값: 1e-4)
   visual_loss_weight: 1.0
   proprio_loss_weight: 0.3

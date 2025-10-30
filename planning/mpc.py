@@ -62,16 +62,12 @@ class MPCPlanner(BasePlanner):
     def _apply_success_mask(self, actions):
         device = actions.device
         mask = torch.tensor(self.is_success).bool()
+        # 성공한 trajectory는 0으로 설정 (이미 normalized 공간)
+        # Planner는 원본 action_dim으로 동작하므로 frameskip rearrange 불필요
         actions[mask] = 0
-        masked_actions = rearrange(
-            actions[mask], "... (f d) -> ... f d", f=self.evaluator.frameskip
-        )
-        masked_actions = self.preprocessor.normalize_actions(masked_actions.cpu())
-        masked_actions = rearrange(masked_actions, "... f d -> ... (f d)")
-        actions[mask] = masked_actions.to(device)
         return actions
 
-    def plan(self, obs_0, obs_g, actions=None):
+    def plan(self, obs_0, obs_g, obs_g_traj=None, actions=None):
         """
         actions is NOT used
         Returns:
@@ -84,14 +80,32 @@ class MPCPlanner(BasePlanner):
         init_obs_0, init_state_0 = self.evaluator.get_init_cond()
 
         cur_obs_0 = obs_0
+        cur_state_0 = None  # 이전 iteration의 마지막 상태 저장
         memo_actions = None
         while not np.all(self.is_success) and self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
+            
+            # 🔧 업데이트된 상태 설정 (평가 전에)
+            if self.iter == 0:
+                print(f"[MPC FIX] Setting initial conditions for iter {self.iter}")
+                self.evaluator.assign_init_cond(
+                    obs_0=init_obs_0,
+                    state_0=init_state_0,
+                )
+                cur_state_0 = init_state_0
+            else:
+                # 이전 iteration의 마지막 상태에서 시작
+                print(f"[MPC FIX] Using updated conditions from previous iter for iter {self.iter}")
+                self.evaluator.assign_init_cond(
+                    obs_0=cur_obs_0,
+                    state_0=cur_state_0,
+                )
             
             # 🔧 MPC에서는 일반 플래닝 사용 (앙상블은 태스크 전환 시에만 사용)
             actions, _ = self.sub_planner.plan(
                 obs_0=cur_obs_0,
                 obs_g=obs_g,
+                obs_g_traj=obs_g_traj,
                 actions=memo_actions,
             )  # (b, t, act_dim)
             taken_actions = actions.detach()[:, : self.n_taken_actions]
@@ -102,18 +116,9 @@ class MPCPlanner(BasePlanner):
             print(f"MPC iter {self.iter} Eval ------- ")
             action_so_far = torch.cat(self.planned_actions, dim=1)
             
-            # 🔧 수정: 첫 번째 iteration에서만 초기 조건 설정
-            if self.iter == 0:
-                print(f"[MPC FIX] Setting initial conditions for iter {self.iter}")
-                self.evaluator.assign_init_cond(
-                    obs_0=init_obs_0,
-                    state_0=init_state_0,
-                )
-            else:
-                print(f"[MPC FIX] Using updated conditions from previous iter for iter {self.iter}")
-            
+            # 🔧 새로 추가된 action만 평가
             logs, successes, e_obses, e_states = self.evaluator.eval_actions(
-                action_so_far,
+                taken_actions,  # action_so_far 대신 새로 추가된 action만
                 self.action_len,
                 filename=f"{self.logging_prefix}_plan{self.iter}",
                 save_video=True,
@@ -134,13 +139,13 @@ class MPCPlanner(BasePlanner):
 
             # update evaluator's init conditions with new env feedback
             e_final_obs = slice_trajdict_with_t(e_obses, start_idx=-1)
-            cur_obs_0 = e_final_obs
             e_final_state = e_states[:, -1]
+            
+            # 다음 iteration을 위한 상태 저장 (중요: cur_state_0도 업데이트)
+            cur_obs_0 = e_final_obs
+            cur_state_0 = e_final_state
+            
             print(f"[MPC FIX] Updating conditions for next iter: final_state shape {e_final_state.shape}")
-            self.evaluator.assign_init_cond(
-                obs_0=e_final_obs,
-                state_0=e_final_state,
-            )
             self.iter += 1
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
 

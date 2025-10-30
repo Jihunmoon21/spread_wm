@@ -31,9 +31,11 @@ class PlanEvaluator:  # evaluator for planning
         is_lora_enabled=False,
         is_online_lora=False,
         workspace=None,
+        obs_g_traj=None,  # 추가: 목표 궤적 (다중 이미지 골용)
     ):
         self.obs_0 = obs_0
         self.obs_g = obs_g
+        self.obs_g_traj = obs_g_traj  # 추가
         self.state_0 = state_0
         self.state_g = state_g
         self.env = env
@@ -144,12 +146,26 @@ class PlanEvaluator:  # evaluator for planning
         i_final_z_obs = self._get_trajdict_last(i_z_obses, action_len + 1)
 
         # rollout in env
-        exec_actions = rearrange(
-            actions.cpu(), "b t (f d) -> b (t f) d", f=self.frameskip
+        # 각 action을 frameskip번 반복 (planner는 원본 action_dim으로 생성)
+        exec_actions = repeat(
+            actions.cpu(), "b t d -> b (t f) d", f=self.frameskip
         )
         exec_actions = self.preprocessor.denormalize_actions(exec_actions).numpy()
 
-        e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions)
+        # state_0가 None이면 각 환경에 None 전달 (환경 기본 reset 사용)
+        if self.state_0 is None:
+            init_states = [None] * len(exec_actions)
+        else:
+            init_states = self.state_0
+        
+        rollout_result = self.env.rollout(self.seed, init_states, exec_actions)
+        
+        # rollout이 infos도 반환하는지 확인 (LIBERO task completion check 포함)
+        if len(rollout_result) == 3:
+            e_obses, e_states, e_infos = rollout_result
+        else:
+            e_obses, e_states = rollout_result
+            e_infos = None
         # # ======================================================= #
         # LoRA 학습이 활성화된 경우, 학습 책임을 OnlineLora 객체에 위임합니다.
         if self.is_lora_enabled and self.workspace.online_learner is not None:
@@ -263,11 +279,39 @@ class PlanEvaluator:  # evaluator for planning
             :, 0
         ]  # reduce dim back
 
+        # 월드 모델 예측 오류 계산: 예측 임베딩 vs 실제 관측 임베딩
+        # 실제 환경 관측을 인코딩
+        trans_e_obses = move_to_device(self.preprocessor.transform_obs(e_obses), self.device)
+        e_z_obses = self.wm.encode_obs(trans_e_obses)
+        
+        # Frameskip 적용: 환경에서는 frameskip번 실행했지만, 월드 모델은 1번만 예측
+        # 따라서 환경 관측을 frameskip 간격으로 리샘플링
+        e_z_obses_resampled = {
+            "visual": e_z_obses["visual"][:, ::self.frameskip, :, :],
+            "proprio": e_z_obses["proprio"][:, ::self.frameskip, :],
+        }
+        
+        # 월드 모델 예측 오류 계산
+        wm_visual_error = torch.nn.functional.mse_loss(
+            i_z_obses["visual"][:, -1:, :, :], 
+            e_z_obses_resampled["visual"][:, -1:, :, :]
+        ).item()
+        
+        wm_proprio_error = torch.nn.functional.mse_loss(
+            i_z_obses["proprio"][:, -1:, :], 
+            e_z_obses_resampled["proprio"][:, -1:, :]
+        ).item() if i_z_obses.get("proprio") is not None else 0
+        
+        print(f"World Model Prediction Error: visual={wm_visual_error:.6f}, proprio={wm_proprio_error:.6f}")
+        
         # compute eval metrics
         logs, successes = self._compute_rollout_metrics(
             e_state=e_final_state,
             e_obs=e_final_obs,
             i_z_obs=i_final_z_obs,
+            e_infos=e_infos,  # LIBERO task completion check 포함
+            wm_visual_error=wm_visual_error,  # 월드 모델 예측 오류 추가
+            wm_proprio_error=wm_proprio_error,
         )
         
 
@@ -289,31 +333,82 @@ class PlanEvaluator:  # evaluator for planning
 
         return logs, successes, e_obses, e_states
 
-    def _compute_rollout_metrics(self, e_state, e_obs, i_z_obs):
+    def _compute_rollout_metrics(self, e_state, e_obs, i_z_obs, e_infos=None, wm_visual_error=None, wm_proprio_error=None):
         """
         Args
             e_state
             e_obs
             i_z_obs
+            e_infos: rollout infos (LIBERO task completion check 포함)
         Return
             logs
             successes
         """
-        eval_results = self.env.eval_state(self.state_g, e_state)
-        successes = eval_results['success']
+        # 우선순위: infos의 success > state 기반 평가 > fallback
+        if e_infos is not None and 'success' in e_infos:
+            # ✅ BEST: LIBERO의 task completion check 사용
+            # infos['success']는 (n_evals, T) 형태, 마지막 step의 success 사용
+            successes = e_infos['success'][:, -1]  # (n_evals,)
+            
+            logs = {
+                'success_rate': np.mean(successes.astype(float))
+            }
+            print(f"Success rate (LIBERO task check): {logs['success_rate']:.3f}")
+            print(f"Successes: {successes}")
+            
+        elif self.state_g is not None:
+            # State 기반 평가
+            eval_results = self.env.eval_state(self.state_g, e_state)
+            successes = eval_results['success']
 
-        logs = {
-            f"success_rate" if key == "success" else f"mean_{key}": np.mean(value) if key != "success" else np.mean(value.astype(float))
-            for key, value in eval_results.items()
-        }
+            logs = {
+                f"success_rate" if key == "success" else f"mean_{key}": np.mean(value) if key != "success" else np.mean(value.astype(float))
+                for key, value in eval_results.items()
+            }
 
-        print("Success rate: ", logs['success_rate'])
-        print(eval_results)
+            print("Success rate (state-based): ", logs['success_rate'])
+            print(eval_results)
+        else:
+            # Fallback
+            print("Warning: No goal state or infos available.")
+            successes = np.zeros(len(e_state), dtype=bool)
+            logs = {}
 
-        visual_dists = np.linalg.norm(e_obs["visual"] - self.obs_g["visual"], axis=1)
+        # Visual distance 계산 (크기가 다를 수 있으므로 리사이즈)
+        e_visual = e_obs["visual"]  # (B, T, H1, W1, C)
+        g_visual = self.obs_g["visual"]  # (B, T, H2, W2, C)
+        
+        # 크기가 다르면 goal 크기에 맞춤
+        if e_visual.shape[2:4] != g_visual.shape[2:4]:
+            from skimage.transform import resize
+            b, t = e_visual.shape[:2]
+            target_h, target_w = g_visual.shape[2:4]
+            
+            # Reshape to (B*T, H, W, C) for resize
+            e_visual_flat = e_visual.reshape(-1, *e_visual.shape[2:])
+            e_visual_resized = []
+            for img in e_visual_flat:
+                img_resized = resize(img, (target_h, target_w, 3), preserve_range=True, anti_aliasing=True)
+                e_visual_resized.append(img_resized)
+            e_visual = np.array(e_visual_resized).reshape(b, t, target_h, target_w, 3)
+        
+        # (B, T, H, W, C) 차이를 flatten해서 L2 norm 계산
+        diff = e_visual - g_visual  # (B, T, H, W, C)
+        b, t = diff.shape[:2]
+        diff_flat = diff.reshape(b, t, -1)  # (B, T, H*W*C)
+        visual_dists = np.linalg.norm(diff_flat, axis=2)  # (B, T)
+        visual_dists = np.mean(visual_dists, axis=1)  # (B,) - average over time
         mean_visual_dist = np.mean(visual_dists)
-        proprio_dists = np.linalg.norm(e_obs["proprio"] - self.obs_g["proprio"], axis=1)
-        mean_proprio_dist = np.mean(proprio_dists)
+        
+        # Proprio distance 계산 (joint_pos + gripper_qpos: 9차원)
+        if e_obs["proprio"].shape == self.obs_g["proprio"].shape:
+            proprio_dists = np.linalg.norm(e_obs["proprio"] - self.obs_g["proprio"], axis=2)  # (B, T)
+            proprio_dists = np.mean(proprio_dists, axis=1)  # (B,)
+            mean_proprio_dist = np.mean(proprio_dists)
+        else:
+            # 차원 불일치 - 디버그용 경고
+            print(f"Warning: Proprio dimension mismatch - env: {e_obs['proprio'].shape}, goal: {self.obs_g['proprio'].shape}. Skipping proprio distance.")
+            mean_proprio_dist = 0.0
 
         e_obs = move_to_device(self.preprocessor.transform_obs(e_obs), self.device)
         e_z_obs = self.wm.encode_obs(e_obs)
@@ -326,6 +421,11 @@ class PlanEvaluator:  # evaluator for planning
             "mean_div_visual_emb": div_visual_emb,
             "mean_div_proprio_emb": div_proprio_emb,
         })
+        
+        # 월드 모델 예측 오류 추가
+        if wm_visual_error is not None:
+            logs["wm_visual_error"] = wm_visual_error
+            logs["wm_proprio_error"] = wm_proprio_error
 
         return logs, successes
 
@@ -338,11 +438,16 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals: (b, t, h, w, c)
         goal: (b, h, w, c)
         """
+        # 데이터 원본 프레임 수를 plan_output과 무관하게 표기
+        if self.workspace is not None and hasattr(self.workspace, "data_traj_lens"):
+            try:
+                print(f"[Data] dataset traj_lens (env frames): {self.workspace.data_traj_lens}")
+            except Exception:
+                pass
         e_visuals = e_visuals[: self.n_plot_samples]
         i_visuals = i_visuals[: self.n_plot_samples]
-        goal_visual = self.obs_g["visual"][: self.n_plot_samples]
-        goal_visual = self.preprocessor.transform_obs_visual(goal_visual)
 
+        # i_visuals의 frameskip padding 먼저 처리
         i_visuals = i_visuals.unsqueeze(2)
         i_visuals = torch.cat(
             [i_visuals] + [i_visuals] * (self.frameskip - 1),
@@ -351,7 +456,115 @@ class PlanEvaluator:  # evaluator for planning
         i_visuals = rearrange(i_visuals, "b t n c h w -> b (t n) c h w")
         i_visuals = i_visuals[:, : i_visuals.shape[1] - (self.frameskip - 1)]
 
+        # pad i_visuals or subsample e_visuals
+        if not self.plot_full:
+            e_visuals = e_visuals[:, :: self.frameskip]
+            i_visuals = i_visuals[:, :: self.frameskip]
+
         correction = 0.3  # to distinguish env visuals and imagined visuals
+        
+        # 최종 프레임 수 결정 (모든 subsample/마스킹 처리 후)
+        n_columns = e_visuals.shape[1]
+        # 디버그: 실제 데이터 프레임 수 로깅
+        try:
+            print(f"[EvalPlot] frames -> env:{e_visuals.shape[1]}, imag:{i_visuals.shape[1]}, n_columns:{n_columns}")
+        except Exception:
+            pass
+        
+        # 목표 이미지 준비: obs_g_traj가 있으면 다중 목표, 없으면 단일 목표
+        if self.obs_g_traj is not None and self.obs_g_traj["visual"].shape[1] > 1:
+            # 다중 목표: 각 프레임 위치에 해당하는 목표 이미지 매핑
+            goal_visual_traj = self.obs_g_traj["visual"][: self.n_plot_samples]
+            goal_visual_traj = self.preprocessor.transform_obs_visual(goal_visual_traj)  # (B, N_goals, C, H, W)
+            
+            # goal_frame_indices 또는 goal_indices를 workspace에서 가져오기
+            goal_indices = None
+            if self.workspace is not None:
+                goal_indices = self.workspace.cfg_dict.get('objective', {}).get('goal_indices', None)
+                if goal_indices is None:
+                    goal_indices = self.workspace.cfg_dict.get('goal_frame_indices', None)
+            
+            n_goals = goal_visual_traj.shape[1]
+            try:
+                print(f"[EvalPlot] goals -> n_goals:{n_goals}, goal_indices:{goal_indices}")
+            except Exception:
+                pass
+            
+            # 최종 프레임 수(n_columns)를 기준으로 목표 이미지 매핑
+            goal_visual_per_frame = []
+            goal_mapping_debug = []  # 디버깅용
+            for frame_idx in range(n_columns):
+                # action step 계산: goal_indices는 action step 기준
+                # plot_full=False: subsample 후 frame_idx = action_step (1:1 매핑)
+                # plot_full=True: padding만 하고 subsample 안 함, frame_idx = action_step * frameskip
+                if self.plot_full and self.frameskip > 1:
+                    # plot_full=True일 때는 environment frame이므로 action step으로 변환
+                    action_step = frame_idx // self.frameskip
+                else:
+                    # plot_full=False일 때는 이미 action step과 1:1 매핑
+                    action_step = frame_idx
+                
+                if goal_indices is not None and len(goal_indices) == n_goals:
+                    # goal_indices를 기반으로 구간별 매핑 (action step 기준)
+                    # 음수 인덱스(-1)는 예측 궤적의 마지막(action step = n_columns - 1)을 의미
+                    # 구간별 매핑: 각 목표가 특정 구간 동안 유지되도록
+                    goal_idx_mapped = 0
+                    
+                    # 실제 goal_idx 값 계산 (음수 인덱스 처리)
+                    actual_goal_indices = []
+                    for goal_idx in goal_indices:
+                        if goal_idx < 0:
+                            actual_goal_indices.append(n_columns - 1)
+                        else:
+                            actual_goal_indices.append(goal_idx)
+                    
+                    # action_step에 따라 적절한 목표 선택
+                    if action_step < actual_goal_indices[0]:
+                        # 첫 번째 목표 이전: 첫 번째 목표 사용
+                        goal_idx_mapped = 0
+                    elif action_step >= actual_goal_indices[-1]:
+                        # 마지막 목표 이후: 마지막 목표 사용
+                        goal_idx_mapped = n_goals - 1
+                    else:
+                        # 중간 구간: 해당 구간의 목표 선택
+                        for i in range(len(actual_goal_indices) - 1):
+                            if actual_goal_indices[i] <= action_step < actual_goal_indices[i + 1]:
+                                goal_idx_mapped = i + 1
+                                break
+                        else:
+                            # 예외 케이스: 마지막 구간
+                            goal_idx_mapped = n_goals - 1
+                    
+                    closest_goal_idx = goal_idx_mapped
+                else:
+                    # goal_indices가 없거나 길이가 다르면 등간격으로 매핑
+                    closest_goal_idx = min(frame_idx * n_goals // n_columns, n_goals - 1)
+                
+                goal_visual_per_frame.append(goal_visual_traj[:, closest_goal_idx:closest_goal_idx+1])
+                goal_mapping_debug.append((frame_idx, action_step, closest_goal_idx))
+            
+            # (B, T, C, H, W) 형태로 변환
+            goal_visual = torch.cat(goal_visual_per_frame, dim=1)
+            try:
+                print(f"[EvalPlot] goal_visual_len:{goal_visual.shape[1]}")
+                # 목표 이미지 매핑 정보 출력
+                mapping_summary = {}
+                for frame_idx, action_step, goal_idx in goal_mapping_debug:
+                    if goal_idx not in mapping_summary:
+                        mapping_summary[goal_idx] = []
+                    mapping_summary[goal_idx].append(f"frame{frame_idx}(step{action_step})")
+                mapping_str = ', '.join([f'goal{i}: [{" ".join(mapping_summary[i])}]' for i in sorted(mapping_summary.keys())])
+                print(f"[EvalPlot] Goal mapping: {mapping_str}")
+            except Exception:
+                pass
+        else:
+            # 단일 목표 (기존 로직)
+            goal_visual = self.obs_g["visual"][: self.n_plot_samples]
+            goal_visual = self.preprocessor.transform_obs_visual(goal_visual)  # (B, 1, C, H, W)
+            try:
+                print(f"[EvalPlot] goal_visual_len(single):{goal_visual.shape[1]}")
+            except Exception:
+                pass
 
         if save_video:
             for idx in range(e_visuals.shape[0]):
@@ -360,11 +573,13 @@ class PlanEvaluator:  # evaluator for planning
                 for i in range(e_visuals.shape[1]):
                     e_obs = e_visuals[idx, i, ...]
                     i_obs = i_visuals[idx, i, ...]
+                    # goal_visual이 (B, T, C, H, W) 형태면 해당 프레임 사용, (B, 1, C, H, W)면 첫 번째 사용
+                    goal_frame = goal_visual[idx, min(i, goal_visual.shape[1]-1)] if goal_visual.ndim == 5 else goal_visual[idx, 0]
                     e_obs = torch.cat(
-                        [e_obs.cpu(), goal_visual[idx, 0] - correction], dim=2
+                        [e_obs.cpu(), goal_frame - correction], dim=2
                     )
                     i_obs = torch.cat(
-                        [i_obs.cpu(), goal_visual[idx, 0] - correction], dim=2
+                        [i_obs.cpu(), goal_frame - correction], dim=2
                     )
                     frame = torch.cat([e_obs - correction, i_obs], dim=1)
                     frame = rearrange(frame, "c w1 w2 -> w1 w2 c")
@@ -382,21 +597,42 @@ class PlanEvaluator:  # evaluator for planning
                     )
                 video_writer.close()
 
-        # pad i_visuals or subsample e_visuals
-        if not self.plot_full:
-            e_visuals = e_visuals[:, :: self.frameskip]
-            i_visuals = i_visuals[:, :: self.frameskip]
-
-        n_columns = e_visuals.shape[1]
+        # n_columns는 이미 위에서 계산됨
         assert (
             i_visuals.shape[1] == n_columns
         ), f"Rollout lengths do not match, {e_visuals.shape[1]} and {i_visuals.shape[1]}"
+        assert (
+            goal_visual.shape[1] == n_columns or goal_visual.shape[1] == 1
+        ), f"Goal visual length {goal_visual.shape[1]} does not match n_columns {n_columns}"
 
-        # add a goal column
-        e_visuals = torch.cat([e_visuals.cpu(), goal_visual - correction], dim=1)
-        i_visuals = torch.cat([i_visuals.cpu(), goal_visual - correction], dim=1)
-        rollout = torch.cat([e_visuals.cpu() - correction, i_visuals.cpu()], dim=1)
-        n_columns += 1
+        # add goal columns: 각 프레임에 해당하는 목표 이미지를 디코더 자리(i_visuals)에 표시
+        if goal_visual.ndim == 5 and goal_visual.shape[1] == n_columns:
+            # 다중 목표: 각 프레임마다 해당하는 목표 이미지를 디코더 자리(i_visuals)에 표시
+            goal_visual_transformed = goal_visual.cpu() - correction  # (B, T, C, H, W)
+            
+            # 실제 환경 이미지는 그대로, 디코더 자리에는 목표 이미지 표시
+            e_visuals = e_visuals.cpu()
+            i_visuals = goal_visual_transformed  # 디코더 자리를 목표 이미지로 대체
+        elif goal_visual.ndim == 5 and goal_visual.shape[1] == 1:
+            # 단일 목표 (B, 1, C, H, W) 형태
+            goal_visual_transformed = goal_visual.cpu() - correction
+            # 모든 프레임에 동일한 목표 이미지 표시
+            goal_visual_repeated = goal_visual_transformed.repeat(1, n_columns, 1, 1, 1)
+            e_visuals = e_visuals.cpu()
+            i_visuals = goal_visual_repeated  # 디코더 자리를 목표 이미지로 대체
+        else:
+            # 단일 목표 (기존 로직): (B, 1, C, H, W) 또는 (B, C, H, W)
+            goal_visual_expanded = goal_visual if goal_visual.ndim == 5 else goal_visual.unsqueeze(1)
+            if goal_visual_expanded.shape[1] == 1:
+                goal_visual_repeated = goal_visual_expanded.repeat(1, n_columns, 1, 1, 1)
+                e_visuals = e_visuals.cpu()
+                i_visuals = goal_visual_repeated[:, :, :, :, :] - correction
+            else:
+                e_visuals = torch.cat([e_visuals.cpu(), goal_visual_expanded[:, 0:1] - correction], dim=1)
+                i_visuals = torch.cat([i_visuals.cpu(), goal_visual_expanded[:, 0:1] - correction], dim=1)
+                n_columns += 1
+        
+        rollout = torch.cat([e_visuals - correction, i_visuals], dim=1)
 
         imgs_for_plotting = rearrange(rollout, "b h c w1 w2 -> (b h) c w1 w2")
         imgs_for_plotting = (

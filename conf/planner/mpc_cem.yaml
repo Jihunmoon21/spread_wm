@@ -1,14 +1,14 @@
 _target_: planning.mpc.MPCPlanner
-max_iter: 1 # unlimited if null
-n_taken_actions: 5
+max_iter: null # unlimited if null
+n_taken_actions: 15
 sub_planner:
   target: planning.cem.CEMPlanner
-  horizon: 5
+  horizon: 15
   topk: 30
-  num_samples: 100 # 300
+  num_samples: 36 # 300
   # 만약 메모리 사용량은 줄인 채 성능은 유지하고 싶다면 마이크로 배치 사용
   var_scale: 1
-  opt_steps: 1 # 30
+  opt_steps: 5 # 30
   eval_every: 1
 
 name: mpc_cem

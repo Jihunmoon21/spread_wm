@@ -122,7 +122,7 @@ for data_name in data_names:
                         img_3rd_flipped = img_3rd_bgr[::-1, ::-1] # Flip
 
                         # JPEG 압축 (품질 95)
-                        result, encimg_3rd = cv2.imencode('.jpg', img_3rd_flipped, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                        result, encimg_3rd = cv2.imencode('.jpg', img_3rd_flipped, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
                         if not result:
                             print(f"경고: third_image 인코딩 실패 ({hdf5_path} / {ep} / frame {i}). 데모 건너<0xEB><0x9B><0x84>.")
                             valid_frames = False
@@ -132,7 +132,7 @@ for data_name in data_names:
                         # 손목 카메라도 동일하게 처리 (RGB -> BGR)
                         img_wrist_rgb = wrist_image_data[i]
                         img_wrist_bgr = cv2.cvtColor(img_wrist_rgb, cv2.COLOR_RGB2BGR)
-                        result, encimg_wrist = cv2.imencode('.jpg', img_wrist_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                        result, encimg_wrist = cv2.imencode('.jpg', img_wrist_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 100])
                         if not result:
                             print(f"경고: wrist_image 인코딩 실패 ({hdf5_path} / {ep} / frame {i}). 데모 건너<0xEB><0x9B><0x84>.")
                             valid_frames = False

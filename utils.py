@@ -112,12 +112,16 @@ def sample_tensors(tensors, n, indices=None):
             tensors[i] = tensor[indices]
     return tensors
 
-
 def cfg_to_dict(cfg):
     cfg_dict = OmegaConf.to_container(cfg)
     for key in cfg_dict:
         if isinstance(cfg_dict[key], list):
-            cfg_dict[key] = ",".join(cfg_dict[key])
+            # --- 수정된 부분 ---
+            # 리스트가 비어있지 않고, 첫 번째 항목이 문자열(str)인지 확인
+            if cfg_dict[key] and isinstance(cfg_dict[key][0], str):
+                cfg_dict[key] = ",".join(cfg_dict[key])
+            # 그 외의 경우 (예: int 리스트)는 리스트를 그대로 둠
+            # --- 수정 끝 ---
     return cfg_dict
 
 def reduce_dict(f: Callable, d: Dict):
@@ -135,3 +139,48 @@ def pil_loader(path):
     with open(path, "rb") as f:
         with Image.open(f) as img:
             return img.convert("RGB")
+
+def select_data_from_indices(data_dict, indices, traj_len):
+    """
+    numpy 배열로 구성된 딕셔너리에서 특정 프레임 인덱스의 데이터를 선택합니다.
+    음수 인덱스(예: -1)를 지원합니다.
+
+    Args:
+        data_dict (dict): 키가 데이터 이름이고 값이 (T, ...) 형태의 numpy 배열인 딕셔너리.
+                          예: {'visual': (T, C, H, W), 'proprio': (T, D)}
+        indices (list[int]): 선택할 프레임 인덱스 리스트 (예: [0, 10, -1]).
+        traj_len (int): 궤적의 전체 길이 (T).
+
+    Returns:
+        dict: 선택된 데이터가 쌓인 새로운 딕셔너리.
+              예: {'visual': (N_indices, C, H, W), 'proprio': (N_indices, D)}
+    """
+    absolute_indices = []
+    for idx in indices:
+        if idx < 0:
+            # 음수 인덱스를 양수 인덱스로 변환 (예: -1 -> traj_len - 1)
+            abs_idx = traj_len + idx
+        else:
+            abs_idx = idx
+        
+        # 인덱스가 유효한 범위 내에 있는지 확인
+        if 0 <= abs_idx < traj_len:
+            absolute_indices.append(abs_idx)
+        else:
+            # 유효하지 않은 인덱스 경고 (선택 사항)
+            print(f"Warning: Index {idx} (absolute: {abs_idx}) is out of bounds for traj_len {traj_len}. Skipping.")
+
+    if not absolute_indices:
+        # 유효한 인덱스가 없으면 빈 배열 반환
+        return {key: np.array([]) for key in data_dict.keys()}
+
+    selected_data = {}
+    for key, data in data_dict.items():
+        try:
+            # numpy의 고급 인덱싱을 사용하여 한 번에 모든 프레임 선택
+            selected_data[key] = data[absolute_indices]
+        except Exception as e:
+            print(f"Error selecting indices {absolute_indices} from key {key} with shape {data.shape}: {e}")
+            selected_data[key] = np.array([]) # 오류 발생 시 빈 배열
+
+    return selected_data

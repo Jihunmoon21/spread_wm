@@ -236,23 +236,47 @@ class LiberoWrapper(gym.Env):
     def _to_spread_obs(self, obs_dict):
         """robosuite obs_dict -> spread_wm 형식으로 변환."""
         img = obs_dict[f"{self.camera_name}_image"]  # (H,W,3) uint8
-        img = img.astype(np.float32) / 255.0
-        img = np.transpose(img, (2, 0, 1))  # (C,H,W)
-        state = obs_dict["robot0_proprio-state"].astype(np.float32)
-        return {"img": img, "state": state}
+        # Robosuite 환경의 카메라 출력은 상하 반전되어 있음
+        # 학습 데이터(HDF5)는 정상 방향이므로, 환경 이미지를 flip하여 일치시킴
+        img = np.flipud(img)
+        img = np.fliplr(img)
+        # HDF5 형식과 일치시키기 위해 (H, W, C) 유지, uint8 유지
+        full_proprio = obs_dict["robot0_proprio-state"].astype(np.float32)
+        
+        # LIBERO HDF5와 Robosuite의 proprio 구조:
+        # - LIBERO HDF5: [joint_pos(7), gripper_qpos(2)] = 9차원
+        # - Robosuite: [joint_pos(7), joint_vel(7), gripper_qpos(2), ...] = 39차원
+        # 
+        # Robosuite proprio_state 구조 (Panda 로봇):
+        # [0:7]   - joint positions
+        # [7:14]  - joint velocities
+        # [14:16] - gripper qpos
+        # [16:...]- 추가 정보 (eef, objects 등)
+        
+        joint_pos = full_proprio[:7]        # 7차원
+        gripper_qpos = full_proprio[14:16]  # 2차원
+        state = np.concatenate([joint_pos, gripper_qpos])  # 9차원
+        
+        # 키 이름을 spread_wm 표준에 맞게 수정
+        return {"visual": img, "proprio": state}
 
     def _ensure_spaces(self, obs_dict):
         """첫 reset 이후 관측 기반으로 observation_space / proprio_dim 설정."""
         if self._observation_space is not None:
             return
-        proprio = obs_dict["robot0_proprio-state"]
-        self.proprio_dim = int(proprio.shape[0])
+        # LIBERO HDF5 데이터셋과 일치 (joint_pos 7 + gripper_qpos 2 = 9차원)
+        self.proprio_dim = 9
+        
+        # 실제 이미지 shape 확인
+        img = obs_dict[f"{self.camera_name}_image"]
+        img_h, img_w = img.shape[:2]
+        
         self._observation_space = gym.spaces.Dict(
             {
-                "img": gym.spaces.Box(
-                    low=0.0, high=1.0, shape=(3, self.img_size, self.img_size), dtype=np.float32
+                "visual": gym.spaces.Box(
+                    low=0, high=255, shape=(img_h, img_w, 3), dtype=np.uint8
                 ),
-                "state": gym.spaces.Box(
+                "proprio": gym.spaces.Box(
                     low=-np.inf, high=np.inf, shape=(self.proprio_dim,), dtype=np.float32
                 ),
             }
@@ -282,7 +306,7 @@ class LiberoWrapper(gym.Env):
 
         sim.data.qpos[:] = qpos
         sim.data.qvel[:] = qvel
-        mujoco.mj_forward(sim.model, sim.data)
+        sim.forward()  # robosuite의 sim.forward() 사용
 
     # ---------- Gym 0.25 API (spread_wm 호환) ----------
     def reset(self):
@@ -480,8 +504,9 @@ class LiberoWrapper(gym.Env):
         # robosuite 환경 리셋
         self.env.reset()
         
-        # 주어진 상태로 설정
-        self._apply_state(init_state)
+        # 주어진 상태로 설정 (init_state=None이면 기본 reset 상태 사용)
+        if init_state is not None:
+            self._apply_state(init_state)
         
         # 최신 관측 반영
         self.raw_obs = self._force_obs()
@@ -538,6 +563,7 @@ class LiberoWrapper(gym.Env):
         Returns:
             obses (dict): 각 키가 (T+1, ...) 형태의 관측 딕셔너리
             states (np.ndarray): (T+1, state_dim) 형태의 상태 배열
+            infos (dict): 각 step의 정보 (success 포함)
         """
         # 초기 상태로 리셋
         obs, state = self.prepare(seed, init_state)
@@ -552,7 +578,8 @@ class LiberoWrapper(gym.Env):
         # 초기 상태를 앞에 추가
         states = np.vstack([np.expand_dims(state, 0), infos["state"]])
         
-        return obses, states
+        # infos도 반환 (LIBERO task completion check 포함)
+        return obses, states, infos
 
     def eval_state(self, goal_state, cur_state):
         """

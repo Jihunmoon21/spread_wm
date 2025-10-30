@@ -35,8 +35,7 @@ def build_libero_stats(dataset_path, cache_json_name='libero_stats.json'):
             # 파일 존재 확인 추가
             if os.path.exists(file_path_str):
                  hdf5_files.append(file_path_str)
-            else:
-                 print(f"Warning: File listed but not found during scan: {file_path_str}. Skipping.")
+            # 누락된 파일은 조용히 건너뜀 (경고 메시지 제거)
         # --- 수정 끝 ---
 
         if not hdf5_files: # 파일 목록이 비었는지 확인
@@ -215,9 +214,7 @@ class LiberoDataset(Dataset):
                     traj_path = self.metas[i]
                     if os.path.exists(traj_path):
                         self.slice_indices.append((i, start_idx))
-                    else:
-                        # 이 경우는 거의 발생하지 않아야 함 (stats 빌드 시 걸러졌으므로)
-                        print(f"Warning: File {traj_path} missing during slice index build. Skipping.")
+                    # 누락된 파일은 조용히 건너뜀 (경고 메시지 제거)
                     # --- 수정 끝 ---
 
         print(f"Total slices: {len(self.slice_indices)}")

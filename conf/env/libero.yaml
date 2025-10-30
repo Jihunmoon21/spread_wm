@@ -9,7 +9,7 @@ kwargs:
 
 dataset:
   _target_: "datasets.libero_dset.load_libero_slice_train_val"
-  data_path: /home/jihoonmun/LIBERO/libero/datasets_processed/libero_goal # libero 데이터셋 절대 경로
+  data_path: /home/jihoonmun/LIBERO/libero/datasets_processed/libero_object # libero 데이터셋 절대 경로
   train_fraction: 0.9
   random_seed: 42
   num_frames: ${addn:${num_hist},${num_pred}}

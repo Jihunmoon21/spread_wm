@@ -79,7 +79,7 @@ def create_objective_fn(alpha, base, mode="last"):
         raise NotImplementedError
 
 # --- 새로운 함수 추가 (수정됨) ---
-def create_trajectory_objective_fn(alpha, goal_indices, goal_weights=None, comparison_mode="indexed_predicted"):
+def create_trajectory_objective_fn(alpha, goal_indices, goal_weights=None, comparison_mode="indexed_predicted", frameskip=1):
     """
     Creates a flexible objective function for image/trajectory goals.
     Compares predicted latent states against pre-encoded goal latent states.
@@ -87,7 +87,9 @@ def create_trajectory_objective_fn(alpha, goal_indices, goal_weights=None, compa
     Args:
         alpha (float): Weight for the proprioceptive state difference.
         goal_indices (list[int]): List of indices specifying which goal frames from
-                                   z_obs_g_traj to use (e.g., [-1] for last, [10, 20, -1] for multiple).
+                                   z_obs_g_traj to use. Can be either:
+                                   - Environment step indices (if frameskip > 1 and input is in env steps)
+                                   - Action step indices (default, frameskip=1 or already converted)
                                    Negative indices count from the end of the *prediction* horizon.
         goal_weights (list[float], optional): List of weights corresponding to goal_indices.
                                               If None, uniform weights are used. Defaults to None.
@@ -97,16 +99,26 @@ def create_trajectory_objective_fn(alpha, goal_indices, goal_weights=None, compa
                                - "indexed_predicted": Compares predicted_frame[i] with goal_frame[i]
                                                       for each absolute index i derived from goal_indices.
                                                       Skips if index is out of prediction bounds.
+        frameskip (int): Number of environment steps per action step. Used to convert
+                         environment step indices to action step indices. Defaults to 1.
 
     Returns:
         function: The objective function.
     """
+    # Convert environment step indices to action step indices if frameskip > 1
+    # This assumes goal_indices are provided in environment step units
+    # If already in action step units, frameskip=1 keeps them unchanged
+    goal_indices_action = [idx if idx < 0 else idx // frameskip for idx in goal_indices]
+    
+    # Adjust goal_weights if provided (should match original goal_indices length)
     if goal_weights is None:
-        goal_weights = [1.0 / len(goal_indices)] * len(goal_indices)
-    if len(goal_weights) != len(goal_indices):
-        raise ValueError("Length of goal_weights must match goal_indices.")
+        goal_weights = [1.0 / len(goal_indices_action)] * len(goal_indices_action)
+    if len(goal_weights) != len(goal_indices_action):
+        raise ValueError(f"Length of goal_weights ({len(goal_weights)}) must match goal_indices ({len(goal_indices_action)}).")
 
     goal_weights = torch.tensor(goal_weights, dtype=torch.float32)
+    # Use converted indices from now on
+    goal_indices = goal_indices_action
 
     def objective_fn(z_obs_pred, z_obs_g_traj):
         """
