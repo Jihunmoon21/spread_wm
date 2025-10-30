@@ -137,8 +137,8 @@ class LiberoWrapper(gym.Env):
         if env_class is None:
             raise ValueError("No suitable environment class found in TASK_MAPPING")
         
-        # LIBERO 버그들을 우회하는 수정사항 적용
-        kwargs = self._apply_libero_fixes(env_class, {
+        # 4-1) 기본 kwargs 구성 후, 사용자가 전달한 **kwargs(YAML)를 병합하여 우선 적용
+        base_kwargs = {
             "robots": ["Panda"],  # 리스트 형태로 수정하여 단일 로봇 명시
             "controller_configs": controller_config,
             "has_renderer": False,
@@ -151,9 +151,46 @@ class LiberoWrapper(gym.Env):
             "control_freq": 20,
             "reward_shaping": False,
             "hard_reset": False,
-        })
+        }
+        # 사용자가 넘긴 추가 인자(**kwargs)를 우선순위 높게 병합
+        if isinstance(kwargs, dict) and len(kwargs) > 0:
+            base_kwargs.update(kwargs)
+
+        # 안전장치: 일부 LIBERO 클래스에서 명시적 인자를 요구
+        # 없으면 기본값을 채워 크래시 방지
+        table_full_size = kwargs.pop("table_full_size", (1.0, 1.2, 0.05))
+        # 타입 정규화: YAML/Config에서 문자열로 들어오는 경우가 있어 float 튜플로 변환
+        try:
+            if isinstance(table_full_size, (list, tuple)):
+                table_full_size = tuple(float(x) for x in table_full_size)
+            elif isinstance(table_full_size, str):
+                # "0.8,0.8,0.05" 형태 지원
+                parts = [p.strip() for p in table_full_size.split(",") if p.strip()]
+                if len(parts) == 3:
+                    table_full_size = tuple(float(p) for p in parts)
+        except Exception:
+            # 문제가 있으면 안전한 기본값 사용
+            table_full_size = (1.0, 1.2, 0.05)
+
+        # LIBERO 버그들을 우회하는 수정사항 적용 (병합된 kwargs 기반)
+        kwargs = self._apply_libero_fixes(env_class, base_kwargs)
+
+        # 래퍼/메타 키 제거: 환경 생성자에 전달되면 오류 발생 가능
+        for k in [
+            "_target_",
+            "task_name",
+            "task_suite_name",
+            "libero_pkl_path",
+            "camera_name",
+            "img_size",
+            "controller_config",
+        ]:
+            kwargs.pop(k, None)
+
+        # 일부 클래스는 table_full_size를 명시적 인자로만 받음
+        table_full_size = kwargs.pop("table_full_size", (1.0, 1.2, 0.05))
         
-        self.env = env_class(bddl_file_name=bddl_file_path, **kwargs)
+        self.env = env_class(bddl_file_name=bddl_file_path, table_full_size=table_full_size, **kwargs)
 
         # 내부 상태
         self.camera_name = camera_name
@@ -530,6 +567,22 @@ class LiberoWrapper(gym.Env):
             dones (np.ndarray): (T,) 형태의 종료 플래그 배열
             infos (dict): 각 키가 (T, ...) 형태의 정보 딕셔너리
         """
+        # 0-step 가드: 빈 시퀀스 처리
+        if actions is None or len(actions) == 0:
+            cur_obs = self.get_obs()
+            cur_state = self.get_state()
+            # (0, ...) 길이의 빈 배열 생성
+            empty_obs = {
+                k: np.empty((0,) + np.asarray(v).shape, dtype=np.asarray(v).dtype)
+                for k, v in cur_obs.items()
+            }
+            empty_rewards = np.empty((0,), dtype=np.float32)
+            empty_dones = np.empty((0,), dtype=bool)
+            empty_infos = {
+                "state": np.empty((0, np.asarray(cur_state).shape[0]), dtype=np.asarray(cur_state).dtype)
+            }
+            return empty_obs, empty_rewards, empty_dones, empty_infos
+
         obses = []
         rewards = []
         dones = []

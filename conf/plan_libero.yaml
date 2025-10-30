@@ -24,7 +24,7 @@ hydra:
 
 # model to load for planning
 ckpt_base_path: /home/jihoonmun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
-model_name: 2025-10-27/libero_object
+model_name: 2025-10-29/libero_spatial_skip3
 model_epoch: latest
 
 seed: 99
@@ -36,7 +36,7 @@ goal_H: 5 # 'dset'에서 사용되던 파라미터. 'trajectory' 모드에서는
 
 # --- 추가된 부분: Trajectory Goal 설정 ---
 goal_traj_index: 2    # 플래닝에 사용할 LIBERO 데모 궤적의 인덱스
-goal_frame_indices: [5] # 목표로 사용할 프레임 인덱스 ([-1] = 마지막 프레임만 사용)
+goal_frame_indices: [10] # 목표로 사용할 프레임 인덱스 ([-1] = 마지막 프레임만 사용)
 # ------------------------------------
 
 n_plot_samples: 10
@@ -117,14 +117,16 @@ env:
   libero_pkl_path: /home/jihoonmun/spread/assets/libero.pkl
 
   # [필수] 실행할 태스크 스위트 (libero.pkl 내부 키와 일치해야 함)
-  task_suite_name: libero_object  # 예: "libero_spatial" 또는 "libero_10"
+  task_suite_name: libero_spatial  # 예: "libero_spatial" 또는 "libero_10"
   
   # [필수] 실행할 태스크의 전체 이름
   # ★★★ 중요: 이 task_name은 위에서 설정한 goal_traj_index (예: 0)에 
   # 해당하는 태스크와 일치해야 합니다. (plan.py에서 동적으로 로드하지 않는 경우)
-  task_name: pick_up_the_ketchup_and_place_it_in_the_basket
+  task_name: pick_up_the_black_bowl_next_to_the_ramekin_and_place_it_on_the_plate
   # pick_up_the_black_bowl_next_to_the_cookie_box_and_place_it_on_the_plate
+  # pick_up_the_ketchup_and_place_it_in_the_basket
 
+  # table_full_size: (1.0, 1.2, 0.05)
   # LBP/OpenVLA 표준을 따르기 위해 256으로 설정
   img_size: 256
   

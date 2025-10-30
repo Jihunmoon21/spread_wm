@@ -131,6 +131,26 @@ class PlanEvaluator:  # evaluator for planning
         n_evals = actions.shape[0]
         if action_len is None:
             action_len = np.full(n_evals, np.inf)
+        # 초기 상태 정합: 데모 state가 없으면 실제 env reset 관측으로 obs_0를 맞춤
+        n_evals = actions.shape[0]
+        if self.state_0 is None and not hasattr(self, "_init_aligned"):
+            try:
+                # 길이 0 액션으로 rollout 호출 → 초기 관측만 획득
+                action_dim = self.workspace.action_dim if self.workspace is not None else actions.shape[-1]
+                zeros = np.zeros((n_evals, 0, action_dim), dtype=np.float32)
+                init_states = [None] * n_evals
+                rollout_result0 = self.env.rollout(self.seed, init_states, zeros)
+                if len(rollout_result0) == 3:
+                    e_obses0, _, _ = rollout_result0
+                else:
+                    e_obses0, _ = rollout_result0
+                # obs_0를 실제 초기 관측으로 동기화
+                self.obs_0 = {k: v[:, 0:1] for k, v in e_obses0.items()}
+                self._init_aligned = True
+            except Exception:
+                # 실패 시 기존 obs_0 유지
+                self._init_aligned = True
+
         # rollout in wm
         trans_obs_0 = move_to_device(
             self.preprocessor.transform_obs(self.obs_0), self.device

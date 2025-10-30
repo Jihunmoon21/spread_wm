@@ -563,12 +563,12 @@ class PlanWorkspace:
              actions_init = None
 
         # --- planner.plan 호출 시 obs_g_traj 전달 (항상) ---
-        actions, action_len = self.planner.plan(
-            obs_0=self.obs_0,
+             actions, action_len = self.planner.plan(
+                 obs_0=self.obs_0,
             obs_g=self.obs_g,
             obs_g_traj=self.obs_g_traj,
-            actions=actions_init,
-        )
+                 actions=actions_init,
+             )
 
 
         logs, successes, _, _ = self.evaluator.eval_actions(
