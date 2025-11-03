@@ -1,9 +1,9 @@
 _target_: planning.mpc.MPCPlanner
-max_iter: 1 # unlimited if null
+max_iter: null # unlimited if null
 n_taken_actions: 5
 sub_planner:
   target: planning.cem.CEMPlanner
-  horizon: 5
+  horizon: 4 # num_hist가 1이면 4로 설정
   topk: 30
   num_samples: 100 # 300
   # 만약 메모리 사용량은 줄인 채 성능은 유지하고 싶다면 마이크로 배치 사용

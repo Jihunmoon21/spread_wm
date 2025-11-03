@@ -56,15 +56,44 @@ class Camera():
         
     def get_cam_params(self):
         # camera intrinsic parameters
-        projMat = pyflex.get_projMatrix().reshape(4, 4).T 
-        cx = self.screenWidth / 2.0
-        cy = self.screenHeight / 2.0
-        fx = projMat[0, 0] * cx
-        fy = projMat[1, 1] * cy
+        # Check if get_projMatrix is available (may not be in headless mode or older PyFlex versions)
+        if hasattr(pyflex, 'get_projMatrix'):
+            try:
+                projMat = pyflex.get_projMatrix().reshape(4, 4).T 
+                cx = self.screenWidth / 2.0
+                cy = self.screenHeight / 2.0
+                fx = projMat[0, 0] * cx
+                fy = projMat[1, 1] * cy
+            except Exception as e:
+                print(f"Warning: Could not get projection matrix: {e}, using default values")
+                # Default intrinsic params (reasonable defaults based on screen size)
+                cx = self.screenWidth / 2.0
+                cy = self.screenHeight / 2.0
+                # Default fov ~70 degrees
+                fov_rad = np.deg2rad(70.0)
+                fx = fy = (self.screenWidth / 2.0) / np.tan(fov_rad / 2.0)
+        else:
+            # Function not available, use default values
+            cx = self.screenWidth / 2.0
+            cy = self.screenHeight / 2.0
+            # Default fov ~70 degrees
+            fov_rad = np.deg2rad(70.0)
+            fx = fy = (self.screenWidth / 2.0) / np.tan(fov_rad / 2.0)
+        
         camera_intrinsic_params = np.array([fx, fy, cx, cy])
 
         # camera extrinsic parameters
-        cam_extrinsic_matrix = pyflex.get_viewMatrix().reshape(4, 4).T
+        # Check if get_viewMatrix is available
+        if hasattr(pyflex, 'get_viewMatrix'):
+            try:
+                cam_extrinsic_matrix = pyflex.get_viewMatrix().reshape(4, 4).T
+            except Exception as e:
+                print(f"Warning: Could not get view matrix: {e}, using identity matrix")
+                # Default to identity matrix (camera at origin looking along -Z)
+                cam_extrinsic_matrix = np.eye(4)
+        else:
+            # Function not available, use identity matrix
+            cam_extrinsic_matrix = np.eye(4)
         
         return camera_intrinsic_params, cam_extrinsic_matrix
     

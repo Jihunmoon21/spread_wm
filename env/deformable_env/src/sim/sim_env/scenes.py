@@ -143,10 +143,15 @@ def granular_scene(obj_params):
     shape_max_dist = 10.0
 
     num_granular_ft_y = 1
+    # Ensure these are integers, not floats
+    num_granular_ft_x = int(num_granular_ft_x)
+    num_granular_ft_y = int(num_granular_ft_y)
+    num_granular_ft_z = int(num_granular_ft_z)
     num_granular_ft = [num_granular_ft_x, num_granular_ft_y, num_granular_ft_z]
     num_granular = int(num_granular_ft_x * num_granular_ft_y * num_granular_ft_z)
 
     print(f"NUM_GRANULAR: {num_granular}")
+    print(f"num_granular_ft: {num_granular_ft}")
 
     pos_granular = [-1.0, 1.0, -1.0]
 

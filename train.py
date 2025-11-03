@@ -220,7 +220,7 @@ class Trainer:
 
         self.proprio_encoder = hydra.utils.instantiate(
             self.cfg.proprio_encoder,
-            in_chans=self.datasets["train"].dataset.proprio_dim,
+            in_chans=self.datasets["train"].proprio_dim,
             emb_dim=self.cfg.proprio_emb_dim,
         )
         proprio_emb_dim = self.proprio_encoder.emb_dim
@@ -229,7 +229,7 @@ class Trainer:
 
         self.action_encoder = hydra.utils.instantiate(
             self.cfg.action_encoder,
-            in_chans=self.datasets["train"].dataset.action_dim,
+            in_chans=self.datasets["train"].action_dim,
             emb_dim=self.cfg.action_emb_dim,
         )
         action_emb_dim = self.action_encoder.emb_dim
@@ -482,7 +482,7 @@ class Trainer:
             loss_components = {
                 key: value.mean().item() for key, value in loss_components.items()
             }
-            if self.cfg.has_decoder and plot:
+            if plot:
                 # only eval images when plotting due to speed
                 if self.cfg.has_predictor:
                     z_obs_out, z_act_out = self.model.separate_emb(z_out)
@@ -554,11 +554,12 @@ class Trainer:
                     f"train_{k}": [v] for k, v in train_rollout_logs.items()
                 }
                 self.logs_update(train_rollout_logs)
-                # val_rollout_logs = self.openloop_rollout(self.val_traj_dset, mode="val")
-                val_rollout_logs = {
-                    f"val_{k}": [v] for k, v in val_rollout_logs.items()
-                }
-                self.logs_update(val_rollout_logs)
+                val_rollout_logs = self.openloop_rollout(self.val_traj_dset, mode="val")
+                if len(val_rollout_logs) > 0:
+                    val_rollout_logs = {
+                        f"val_{k}": [v] for k, v in val_rollout_logs.items()
+                    }
+                    self.logs_update(val_rollout_logs)
 
         self.accelerator.wait_for_everyone()
         for i, data in enumerate(
@@ -653,28 +654,31 @@ class Trainer:
         num_past = [(self.cfg.num_hist, ""), (1, "_1framestart")]
 
         # sample traj
+        # precompute valid trajectory indices to avoid infinite loop when sequences are too short
+        min_required_len = min_horizon * self.cfg.frameskip + 1
+        valid_indices = [i for i in range(len(dset)) if dset.get_seq_length(i) > min_required_len]
+        if len(valid_indices) == 0:
+            return logs  # no valid trajectories; skip rollout gracefully
+
         for idx in range(num_rollout):
-            valid_traj = False
-            while not valid_traj:
-                traj_idx = np.random.randint(0, len(dset))
-                obs, act, state, _ = dset[traj_idx]
-                act = act.to(self.device)
-                if rand_start_end:
-                    if obs["visual"].shape[0] > min_horizon * self.cfg.frameskip + 1:
-                        start = np.random.randint(
-                            0,
-                            obs["visual"].shape[0] - min_horizon * self.cfg.frameskip - 1,
-                        )
-                    else:
-                        start = 0
-                    max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
-                    if max_horizon > min_horizon:
-                        valid_traj = True
-                        horizon = np.random.randint(min_horizon, max_horizon + 1)
-                else:
-                    valid_traj = True
+            traj_idx = np.random.choice(valid_indices)
+            obs, act, state, _ = dset[traj_idx]
+            act = act.to(self.device)
+            if rand_start_end:
+                start = np.random.randint(
+                    0,
+                    max(1, obs["visual"].shape[0] - min_required_len)
+                )
+                max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
+                # ensure at least min_horizon steps; clamp horizon bounds
+                if max_horizon <= min_horizon:
+                    # fallback to start=0
                     start = 0
-                    horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
+                    max_horizon = (obs["visual"].shape[0] - start - 1) // self.cfg.frameskip
+                horizon = max(min_horizon, min(max_horizon, min_horizon))
+            else:
+                start = 0
+                horizon = (obs["visual"].shape[0] - 1) // self.cfg.frameskip
 
             for k in obs.keys():
                 obs[k] = obs[k][

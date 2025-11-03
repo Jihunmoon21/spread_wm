@@ -271,21 +271,32 @@ class PlanEvaluator:  # evaluator for planning
         )
         
 
-        # plot trajs
-        if self.wm.decoder is not None:
-            i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
-            i_visuals = self._mask_traj(
-                i_visuals, action_len + 1
-            )  # we have action_len + 1 states
-            e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
-            e_visuals = self._mask_traj(e_visuals, action_len * self.frameskip + 1)
-            self._plot_rollout_compare(
-                e_visuals=e_visuals,
-                i_visuals=i_visuals,
-                successes=successes,
-                save_video=save_video,
-                filename=filename,
-            )
+        # plot/save rollouts
+        if save_video:
+            if self.wm.decoder is not None:
+                i_visuals = self.wm.decode_obs(i_z_obses)[0]["visual"]
+                i_visuals = self._mask_traj(
+                    i_visuals, action_len + 1
+                )  # we have action_len + 1 states
+                e_visuals_t = self.preprocessor.transform_obs_visual(e_visuals)
+                e_visuals_t = self._mask_traj(
+                    e_visuals_t, action_len * self.frameskip + 1
+                )
+                self._plot_rollout_compare(
+                    e_visuals=e_visuals_t,
+                    i_visuals=i_visuals,
+                    successes=successes,
+                    save_video=True,
+                    filename=filename,
+                )
+            else:
+                # decoder가 없으면 환경 영상만 저장
+                self._plot_rollout_env_only(
+                    e_visuals=e_visuals,
+                    successes=successes,
+                    save_video=True,
+                    filename=filename,
+                )
 
         return logs, successes, e_obses, e_states
 
@@ -408,6 +419,57 @@ class PlanEvaluator:  # evaluator for planning
             imgs_for_plotting,
             f"{filename}.png",
             nrow=n_columns,  # nrow is the number of columns
+            normalize=True,
+            value_range=(-1, 1),
+        )
+
+    def _plot_rollout_env_only(self, e_visuals, successes, save_video=False, filename=""):
+        """
+        디코더가 없을 때, 환경에서 관측된 프레임(e_visuals)과 목표 이미지를 이용해
+        PNG/MP4를 저장합니다.
+        """
+        # 시각 데이터 정규화 및 샘플 수 제한
+        e_visuals = self.preprocessor.transform_obs_visual(e_visuals)
+        e_visuals = e_visuals[: self.n_plot_samples]
+        goal_visual = self.obs_g["visual"][: self.n_plot_samples]
+        goal_visual = self.preprocessor.transform_obs_visual(goal_visual)
+
+        correction = 0.3
+
+        # 비디오 저장: 각 샘플별로 실행 프레임과 목표 한 장을 좌우로 붙여 저장
+        if save_video:
+            for idx in range(e_visuals.shape[0]):
+                success_tag = "success" if successes[idx] else "failure"
+                frames = []
+                for i in range(e_visuals.shape[1]):
+                    e_obs = e_visuals[idx, i, ...]
+                    frame = torch.cat(
+                        [e_obs.cpu() - correction, goal_visual[idx, 0] - correction],
+                        dim=2,
+                    )
+                    frame = rearrange(frame, "c w1 w2 -> w1 w2 c")
+                    frame = frame.detach().cpu().numpy()
+                    frames.append(frame)
+                video_writer = imageio.get_writer(
+                    f"{filename}_{idx}_{success_tag}.mp4", fps=12
+                )
+                for frame in frames:
+                    frame = frame * 2 - 1 if frame.min() >= 0 else frame
+                    video_writer.append_data(
+                        (((np.clip(frame, -1, 1) + 1) / 2) * 255).astype(np.uint8)
+                    )
+                video_writer.close()
+
+        # 이미지 그리드 저장: 마지막 프레임과 목표 이미지를 좌우로 붙여 한 장으로 저장
+        if not self.plot_full:
+            e_visuals = e_visuals[:, :: self.frameskip]
+        last_frames = e_visuals[:, -1]  # (b, c, h, w)
+        goal_frames = goal_visual[:, 0]  # (b, c, h, w)
+        rollout = torch.cat([last_frames.cpu() - correction, goal_frames - correction], dim=2)
+        utils.save_image(
+            rollout,
+            f"{filename}.png",
+            nrow=1,
             normalize=True,
             value_range=(-1, 1),
         )

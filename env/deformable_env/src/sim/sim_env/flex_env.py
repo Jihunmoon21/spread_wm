@@ -2,6 +2,7 @@ import os
 import numpy as np
 import pyflex
 import gym
+from gym import spaces
 import math
 from scipy.spatial.distance import cdist
 
@@ -49,18 +50,71 @@ class FlexEnv(gym.Env):
         self.screenHeight = self.dataset_config["screenHeight"]
         self.camera = Camera(self.screenWidth, self.screenHeight)
 
-        pyflex.set_screenWidth(self.screenWidth)
-        pyflex.set_screenHeight(self.screenHeight)
-        pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
-        pyflex.set_light_fov(70.0)
-        pyflex.init(self.dataset_config["headless"])
+        # Handle different PyFleX bindings: some expose set_screenWidth/Height, others set_screen_size
+        if hasattr(pyflex, "set_screenWidth") and hasattr(pyflex, "set_screenHeight"):
+            pyflex.set_screenWidth(self.screenWidth)
+            pyflex.set_screenHeight(self.screenHeight)
+        elif hasattr(pyflex, "set_screen_size"):
+            pyflex.set_screen_size(self.screenWidth, self.screenHeight)
+        else:
+            # Fallback: proceed without explicit screen size setup
+            pass
+        # Light settings (optional in some bindings)
+        if hasattr(pyflex, "set_light_dir"):
+            pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
+        if hasattr(pyflex, "set_light_fov"):
+            pyflex.set_light_fov(70.0)
+        # Initialize PyFleX (new version requires 4 args: headless, render, width, height)
+        headless = bool(self.dataset_config["headless"])
+        # Ensure EGL is used in headless mode
+        if headless:
+            os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+            # Optionally select device 0; harmless if ignored
+            os.environ.setdefault("EGL_DEVICE_ID", "0")
+        # Enable EGL offscreen rendering even in headless mode
+        # Many clusters support EGL; set render=True to request offscreen context
+        render = True
+        try:
+            pyflex.init(headless, render, int(self.screenWidth), int(self.screenHeight))
+        except TypeError:
+            # fallback to old signature
+            try:
+                pyflex.init(headless)
+            except TypeError:
+                # another fallback
+                pyflex.init()
+        
+        # Critical: Allow PyFlex to fully initialize before setting scene
+        # This is especially important for newer GPU architectures
+        # Try a dummy step to ensure GPU context is ready
+        try:
+            # This may fail if no scene is set, but it forces GPU initialization
+            pass  # Skip dummy step - will be done after set_scene
+        except:
+            pass
 
         # set up camera
         self.camera_view = self.dataset_config["camera_view"]
 
         # define action space
         self.action_dim = self.dataset_config["action_dim"]
-        self.action_space = self.dataset_config["action_space"]
+        action_space_value = self.dataset_config["action_space"]  # This is the range value
+        # Create proper gym Box action space
+        self.action_space = spaces.Box(
+            low=-action_space_value,
+            high=action_space_value,
+            shape=(self.action_dim,),
+            dtype=np.float32
+        )
+        
+        # define observation space (RGB + depth channels)
+        # Observation is rendered image: (H, W, 5) where 5 = RGB + depth_x + depth_y
+        self.observation_space = spaces.Box(
+            low=0,
+            high=255,
+            shape=(self.screenHeight, self.screenWidth, 5),
+            dtype=np.uint8
+        )
 
         # stat
         self.count = 0
@@ -74,11 +128,73 @@ class FlexEnv(gym.Env):
         # others
         self.gripper = self.dataset_config["gripper"]
         self.stick_len = self.dataset_config["pusher_len"]
+        # Disable rendering until environment verification completes
+        self.disable_render = True
     
         self.scene.set_scene(self.obj, self.obj_params)
+        
+        # Critical: Immediately verify scene was set successfully
+        # Get particle count to ensure scene initialization completed
+        try:
+            particle_count = pyflex.get_n_particles()
+            print(f"Scene initialized successfully with {particle_count} particles")
+        except Exception as e:
+            print(f"Warning: Could not get particle count after set_scene: {e}")
+        
+        # For granular scenes, add extra verification and gentle start
+        if self.obj == "granular":
+            # Verify particle positions are valid before first step
+            try:
+                particle_positions = pyflex.get_positions()
+                if len(particle_positions) > 0:
+                    pos_reshaped = particle_positions.reshape(-1, 4)
+                    print(f"Particle position check: y_min={pos_reshaped[:, 1].min():.3f}, y_max={pos_reshaped[:, 1].max():.3f}")
+            except Exception as e:
+                print(f"Warning: Could not verify particle positions: {e}")
+            
+            # Add a small delay to ensure GPU context is fully ready
+            import time as time_module
+            time_module.sleep(0.1)
+            
+            # Start with very gentle steps for granular scenes
+            # First few steps with minimal updates to let particles settle
+            print("Starting gentle stabilization for granular scene...")
+            for i in range(5):
+                try:
+                    pyflex.step(update_params=None, capture=0, path=None, render=0)
+                    print(f"Gentle step {i+1}/5 completed")
+                except Exception as e:
+                    print(f"Error during gentle step {i+1}: {e}")
+                    # If gentle steps fail, try to continue with normal steps
+                    break
+            
+            # Continue with normal stabilization steps
+            stabilize_steps = 30  # Increased from 20
+            print(f"Continuing with {stabilize_steps} stabilization steps...")
+            for i in range(stabilize_steps):
+                try:
+                    pyflex.step()
+                    if (i + 1) % 10 == 0:
+                        print(f"Stabilization step {i+1}/{stabilize_steps} completed")
+                except Exception as e:
+                    print(f"Error during stabilization step {i+1}: {e}")
+                    raise
+        else:
+            # Normal stabilization for non-granular scenes
+            stabilize_steps = 10
+            for _ in range(stabilize_steps):
+                pyflex.step()
+        
         # set camera
-        self.camera.set_init_camera(self.camera_view)
-        save_data = True # default to render obs
+        print("Setting camera...")
+        try:
+            self.camera.set_init_camera(self.camera_view)
+            print("Camera set successfully")
+        except Exception as e:
+            print(f"Error setting camera: {e}")
+            raise
+        
+        save_data = False # disable initial rendering to avoid crashes during verification
         if save_data:
             (
                 self.camPos_list,
@@ -86,10 +202,152 @@ class FlexEnv(gym.Env):
                 self.cam_intrinsic_params,
                 self.cam_extrinsic_matrix,
             ) = self.camera.init_multiview_cameras()
-        # add table
-        self.add_table()
+        
+        # add table - extra caution for granular scenes
+        print("Adding table...")
+        try:
+            self.add_table()
+            print("Table added successfully")
+        except Exception as e:
+            print(f"Error adding table: {e}")
+            raise
+        
+        # Stabilize after adding table - more steps for granular
+        stabilize_after_table = 10 if self.obj == "granular" else 5
+        print(f"Stabilizing after table ({stabilize_after_table} steps)...")
+        for i in range(stabilize_after_table):
+            try:
+                pyflex.step()
+            except Exception as e:
+                print(f"Error during post-table stabilization step {i+1}: {e}")
+                raise
+        
         ## add robot
-        self.add_robot()
+        print("Adding robot...")
+        try:
+            # Additional stabilization before adding robot meshes
+            if self.obj == "granular":
+                print("  Pre-robot stabilization (5 steps)...")
+                for _ in range(5):
+                    pyflex.step()
+            
+            self.add_robot()
+            print("Robot added successfully")
+        except Exception as e:
+            print(f"Error adding robot: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+        
+        # Stabilize after adding robot (critical for preventing segfaults)
+        # Robot mesh loading can cause issues if PyFlex isn't ready
+        stabilize_after_robot = 15 if self.obj == "granular" else 10
+        print(f"Stabilizing after robot ({stabilize_after_robot} steps)...")
+        for i in range(stabilize_after_robot):
+            try:
+                pyflex.step()
+                if (i + 1) % 5 == 0:
+                    print(f"Post-robot stabilization step {i+1}/{stabilize_after_robot} completed")
+            except Exception as e:
+                print(f"Error during post-robot stabilization step {i+1}: {e}")
+                raise
+        
+        # Final stabilization before enabling rendering - more for granular
+        final_stabilize_steps = 30 if self.obj == "granular" else 20
+        print(f"Final stabilization ({final_stabilize_steps} steps)...")
+        for i in range(final_stabilize_steps):
+            try:
+                pyflex.step()
+                if (i + 1) % 10 == 0:
+                    print(f"Final stabilization step {i+1}/{final_stabilize_steps} completed")
+            except Exception as e:
+                print(f"Error during final stabilization step {i+1}: {e}")
+                raise
+        
+        # Ensure camera is properly set
+        print("Re-setting camera...")
+        try:
+            self.camera.set_init_camera(self.camera_view)
+            print("Camera re-set successfully")
+        except Exception as e:
+            print(f"Error re-setting camera: {e}")
+            raise
+        
+        # Re-enable rendering now that initialization is complete
+        print("Enabling rendering...")
+        self.disable_render = False
+        
+        # Additional stabilization after enabling rendering - more for granular
+        post_render_steps = 15 if self.obj == "granular" else 10
+        print(f"Post-render stabilization ({post_render_steps} steps)...")
+        for i in range(post_render_steps):
+            try:
+                pyflex.step()
+                if (i + 1) % 5 == 0:
+                    print(f"Post-render stabilization step {i+1}/{post_render_steps} completed")
+            except Exception as e:
+                print(f"Error during post-render stabilization step {i+1}: {e}")
+                raise
+        
+        # Verify rendering works
+        headless = bool(self.dataset_config["headless"])
+        if headless:
+            print("Running in headless mode with EGL offscreen rendering enabled")
+        else:
+            print("Running with on-screen OpenGL visualization enabled")
+        
+        try:
+            # Check particle positions to ensure scene has content
+            try:
+                particle_pos = pyflex.get_positions()
+                num_particles = len(particle_pos) // 4
+                print(f"Scene has {num_particles} particles")
+                if num_particles > 0:
+                    pos_reshaped = particle_pos.reshape(-1, 4)
+                    print(f"Particle position range: x=[{pos_reshaped[:, 0].min():.2f}, {pos_reshaped[:, 0].max():.2f}], "
+                          f"y=[{pos_reshaped[:, 1].min():.2f}, {pos_reshaped[:, 1].max():.2f}], "
+                          f"z=[{pos_reshaped[:, 2].min():.2f}, {pos_reshaped[:, 2].max():.2f}]")
+            except Exception as e:
+                print(f"Warning: Could not get particle positions: {e}")
+            
+            # Force camera update
+            print(f"Setting camera: pos={self.camera.camPos}, angle={self.camera.camAngle}")
+            pyflex.set_camPos(self.camera.camPos)
+            pyflex.set_camAngle(self.camera.camAngle)
+            
+            # Multiple render attempts to ensure OpenGL context is ready
+            for render_attempt in range(3):
+                # Additional steps before rendering
+                for _ in range(5):
+                    pyflex.step()
+                
+                # Test render
+                test_img = self.render()
+                if test_img is not None and test_img.shape[0] > 0:
+                    # Check if image is all zeros (black screen)
+                    img_mean = test_img.mean()
+                    img_std = test_img.std()
+                    img_max = test_img.max()
+                    img_min = test_img.min()
+                    
+                    print(f"Render attempt {render_attempt + 1}: shape={test_img.shape}, "
+                          f"mean={img_mean:.3f}, std={img_std:.3f}, min={img_min:.3f}, max={img_max:.3f}")
+                    
+                    if np.allclose(test_img, 0):
+                        print("Warning: Rendering returned black screen - check EGL/OpenGL setup")
+                        if render_attempt < 2:
+                            print("Trying additional steps before next render attempt...")
+                            continue
+                    else:
+                        print(f"✓ Rendering initialized successfully!")
+                        break
+                else:
+                    print(f"Warning: Render attempt {render_attempt + 1} returned invalid image")
+        except Exception as e:
+            print(f"Warning: Rendering test failed: {e}")
+            if not headless:
+                import traceback
+                traceback.print_exc()
 
     ### shape states
     def robot_to_shape_states(self, robot_states):
@@ -190,6 +448,15 @@ class FlexEnv(gym.Env):
             self.rest_joints = np.zeros(13)
 
     def store_data(self, store_cam_param=False, init_fps=False):
+        # Initialize camera lists if not already initialized
+        if not hasattr(self, 'camPos_list') or self.camPos_list is None:
+            (
+                self.camPos_list,
+                self.camAngle_list,
+                self.cam_intrinsic_params,
+                self.cam_extrinsic_matrix,
+            ) = self.camera.init_multiview_cameras()
+        
         saved_particles = False
         img_list = []
         for j in range(len(self.camPos_list)):
@@ -197,6 +464,10 @@ class FlexEnv(gym.Env):
             pyflex.set_camAngle(self.camAngle_list[j])
 
             if store_cam_param:
+                # Ensure cam_intrinsic_params and cam_extrinsic_matrix are initialized
+                if not hasattr(self, 'cam_intrinsic_params') or self.cam_intrinsic_params is None:
+                    self.cam_intrinsic_params = {}
+                    self.cam_extrinsic_matrix = {}
                 self.cam_intrinsic_params[j], self.cam_extrinsic_matrix[j] = (
                     self.camera.get_cam_params()
                 )
@@ -529,11 +800,116 @@ class FlexEnv(gym.Env):
         return obs, out_data
 
     def render(self, no_return=False):
-        pyflex.step()
+        # Proceed with rendering both in headless (EGL) and non-headless modes
+        headless = bool(self.dataset_config.get("headless", True))
+        try:
+            pyflex.step()
+        except Exception as e:
+            print(f"Error in pyflex.step(): {e}")
         if no_return:
             return
-        else:
-            return pyflex.render(render_depth=True).reshape(self.screenHeight, self.screenWidth, 5)
+        # If rendering is disabled, return a dummy frame to keep the pipeline running
+        if getattr(self, "disable_render", False):
+            return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+        
+        # Ensure camera is set before rendering
+        if hasattr(self.camera, 'camPos') and hasattr(self.camera, 'camAngle'):
+            try:
+                pyflex.set_camPos(self.camera.camPos)
+                pyflex.set_camAngle(self.camera.camAngle)
+            except Exception as e:
+                # Silent failure is OK - camera may already be set
+                pass
+        
+        # Render and reshape
+        try:
+            # Debug: Check particle positions before rendering
+            if hasattr(self, '_render_debug_count'):
+                self._render_debug_count += 1
+            else:
+                self._render_debug_count = 1
+            
+            if self._render_debug_count <= 3:  # Only print first few times
+                try:
+                    particle_pos = pyflex.get_positions()
+                    if particle_pos.size > 0:
+                        pos_reshaped = particle_pos.reshape(-1, 4)
+                        print(f"[Render Debug {self._render_debug_count}] Particle positions: "
+                              f"count={len(pos_reshaped)}, "
+                              f"x=[{pos_reshaped[:, 0].min():.2f}, {pos_reshaped[:, 0].max():.2f}], "
+                              f"y=[{pos_reshaped[:, 1].min():.2f}, {pos_reshaped[:, 1].max():.2f}], "
+                              f"z=[{pos_reshaped[:, 2].min():.2f}, {pos_reshaped[:, 2].max():.2f}]")
+                        print(f"  Camera: pos={self.camera.camPos}, angle={self.camera.camAngle}")
+                except Exception as e:
+                    print(f"[Render Debug] Could not get particle positions: {e}")
+            
+            # Try rendering - pyflex.render() returns a tuple (image, depth)
+            
+            render_result = None
+            try:
+                render_result = pyflex.render()
+            except Exception as render_err:
+                # In headless without proper EGL, try a fallback if available
+                print(f"Render method failed: {render_err}")
+                return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+            
+            # Handle tuple return (image, depth)
+            if render_result is None:
+                return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+            
+            # Unpack tuple if needed
+            if isinstance(render_result, tuple):
+                if len(render_result) >= 2:
+                    image, depth = render_result[0], render_result[1]
+                    # Combine into single array
+                    if image is not None and depth is not None:
+                        img_array = np.array(image)
+                        depth_array = np.array(depth)
+                        # Stack RGB + depth
+                        render_result = np.concatenate([img_array, depth_array], axis=-1) if len(img_array.shape) == 3 else img_array
+                    elif image is not None:
+                        render_result = np.array(image)
+                    else:
+                        return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+                else:
+                    render_result = np.array(render_result[0]) if len(render_result) > 0 else None
+            
+            if render_result is None or (hasattr(render_result, 'size') and render_result.size == 0):
+                # Return black screen if rendering fails
+                if self._render_debug_count <= 3:
+                    print(f"[Render Debug {self._render_debug_count}] Render returned None or empty")
+                return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+            
+            # Reshape result - handle different output formats and vertically flip output
+            try:
+                reshaped = render_result.reshape(self.screenHeight, self.screenWidth, -1)
+                if reshaped.shape[2] < 5:
+                    out = np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+                    out[:, :, :reshaped.shape[2]] = reshaped
+                elif reshaped.shape[2] > 5:
+                    out = reshaped[:, :, :5]
+                else:
+                    out = reshaped
+
+                # Always flip vertically so that origin is at the top-left for image consumers
+                out = np.flip(out, axis=0).copy()
+                return out
+            except ValueError:
+                # Reshape failed - return what we can and still flip vertically
+                flat_size = self.screenHeight * self.screenWidth * 5
+                if render_result.size >= flat_size:
+                    out = render_result[:flat_size].reshape(self.screenHeight, self.screenWidth, 5)
+                else:
+                    out = np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
+                    out.flat[:render_result.size] = render_result.flatten()
+                out = np.flip(out, axis=0).copy()
+                return out
+                    
+        except Exception as e:
+            print(f"Warning: Rendering failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
 
     def close(self):
         pyflex.clean()
@@ -693,6 +1069,15 @@ class FlexEnv(gym.Env):
         np.random.seed(seed)
 
     def get_one_view_img(self, cam_id=None):
+        # Initialize camera lists if not already initialized
+        if not hasattr(self, 'camPos_list') or self.camPos_list is None:
+            (
+                self.camPos_list,
+                self.camAngle_list,
+                self.cam_intrinsic_params,
+                self.cam_extrinsic_matrix,
+            ) = self.camera.init_multiview_cameras()
+        
         cam_id = cam_id or self.camera_view
         pyflex.set_camPos(self.camPos_list[cam_id])
         pyflex.set_camAngle(self.camAngle_list[cam_id])

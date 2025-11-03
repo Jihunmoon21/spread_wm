@@ -14,10 +14,10 @@ dataset:
   n_worker: 40
   
   # sim env
-  headless: True # False: OpenGL visualization
+  headless: False # False: OpenGL visualization
   camera_view: 1 # 0 (top view), 1, 2, 3, 4
-  screenWidth: 224
-  screenHeight: 224
+  screenWidth: 224 # 224
+  screenHeight: 224 # 224
 
   robot_type: 'xarm6' 
   robot_end_idx: 6

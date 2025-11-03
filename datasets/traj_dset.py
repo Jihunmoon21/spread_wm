@@ -97,7 +97,7 @@ class TrajSlicerDataset(TrajDataset):
         state = state[start:end:self.frameskip]
         act = act[start:end]
         act = rearrange(act, "(n f) d -> n (f d)", n=self.num_frames)  # concat actions
-        return tuple([obs, act, state])
+        return obs, act, state, {}
 
 
 def random_split_traj(

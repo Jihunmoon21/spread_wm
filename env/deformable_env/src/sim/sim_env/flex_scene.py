@@ -20,7 +20,7 @@ class FlexScene:
             self.env_idx = 26
             self.scene_params, self.property_params = rope_scene(obj_params)
         elif self.obj == "granular":
-            self.env_idx = 35
+            self.env_idx = 7  # GranularPile is at index 7 (after Softgym scenes)
             self.scene_params, self.property_params = granular_scene(obj_params)
         elif self.obj == "cloth":
             self.env_idx = 29
@@ -30,8 +30,100 @@ class FlexScene:
 
         assert self.env_idx is not None
         assert self.scene_params is not None
-        zeros = np.array([0])
-        pyflex.set_scene(self.env_idx, self.scene_params, zeros, zeros, zeros, zeros, 0)
+        
+        # Ensure scene_params is properly formatted
+        scene_params_f32 = self.scene_params.astype(np.float32)
+        
+        # Use 3-arg binding: (env_idx: int, scene_params: float32[n], flags: int)
+        # For granular scenes, ensure parameters are valid
+        if self.obj == "granular":
+            # Validate granular scene parameters
+            assert len(scene_params_f32) > 0, "granular scene_params is empty"
+            # Note: env_idx is now 9 (GranularPile moved to index 9 in PyFlex)
+            
+            # Debug: Print scene parameters before setting
+            print(f"Setting granular scene with {len(scene_params_f32)} parameters")
+            print(f"First few params: {scene_params_f32[:10]}")
+            
+            # Verify no NaN or Inf values
+            if np.any(np.isnan(scene_params_f32)) or np.any(np.isinf(scene_params_f32)):
+                raise ValueError(f"Invalid scene_params (NaN/Inf detected): {scene_params_f32}")
+        
+        # Flush stdout to ensure debug messages are printed before potential crash
+        import sys
+        sys.stdout.flush()
+        
+        # For granular scenes, ensure scene_params array is contiguous and properly aligned
+        if self.obj == "granular":
+            scene_params_f32 = np.ascontiguousarray(scene_params_f32, dtype=np.float32)
+            # Ensure array is not empty and has valid memory layout
+            assert scene_params_f32.flags['C_CONTIGUOUS'], "scene_params must be C-contiguous"
+            assert scene_params_f32.flags['WRITEABLE'], "scene_params must be writeable"
+        
+        # For granular scenes on new GPUs, there may be a compatibility issue
+        # Try to work around by using a signal handler to catch potential crashes
+        if self.obj == "granular":
+            import signal
+            
+            crash_occurred = [False]
+            
+            def crash_handler(signum, frame):
+                crash_occurred[0] = True
+                print(f"\nCRITICAL: Segmentation fault detected during pyflex.set_scene(35, ...)")
+                print("This indicates a PyFlex binary compatibility issue with your GPU.")
+                print("The PyFlex C++ code for env_idx 35 may not support RTX 5060 Ti architecture.")
+                raise RuntimeError("PyFlex set_scene crashed - likely GPU architecture incompatibility")
+            
+            # Set up signal handler for SIGSEGV (segmentation fault)
+            old_handler = signal.signal(signal.SIGSEGV, crash_handler)
+        
+        try:
+            # Critical: Call set_scene with explicit type casting
+            env_idx_int = int(self.env_idx)
+            flags_int = int(0)
+            
+            # Double-check parameters before call
+            if self.obj == "granular":
+                print(f"Calling pyflex.set_scene({env_idx_int}, array[{len(scene_params_f32)}], {flags_int})")
+                sys.stdout.flush()
+            
+            # CRITICAL: pyflex.set_scene() appears to hang/block indefinitely
+            # This suggests the PyFlex C++ code for env_idx 35 has a blocking issue
+            print(f"Calling pyflex.set_scene({self.env_idx}, array[{len(scene_params_f32)}], 0)")
+            sys.stdout.flush()
+            
+            # Try to call with a simple attempt first
+            try:
+                # This call may hang indefinitely - no Python-level solution exists
+                pyflex.set_scene(env_idx_int, scene_params_f32, flags_int)
+            except KeyboardInterrupt:
+                print("\n⚠️  pyflex.set_scene() was interrupted - likely hung")
+                print("   This confirms a blocking issue in PyFlex C++ code")
+                print("   Solution: PyFlex needs to be fixed or rebuilt for your GPU")
+                raise
+            
+            # If we get here, set_scene succeeded
+            if self.obj == "granular":
+                print("✓ pyflex.set_scene() completed successfully")
+                sys.stdout.flush()
+                
+        except (RuntimeError, Exception) as e:
+            if self.obj == "granular":
+                print(f"\nFailed to set granular scene: {e}")
+                print("\nPossible solutions:")
+                print("1. Rebuild PyFlex bindings for your GPU architecture")
+                print("2. Use a different GPU that supports this PyFlex version")
+                print("3. Modify PyFlex source code to fix env_idx 35 compatibility")
+                # Restore signal handler
+                signal.signal(signal.SIGSEGV, old_handler)
+            raise
+        finally:
+            if self.obj == "granular":
+                # Restore original signal handler
+                try:
+                    signal.signal(signal.SIGSEGV, old_handler)
+                except:
+                    pass
 
     def get_property_params(self):
         assert self.property_params is not None

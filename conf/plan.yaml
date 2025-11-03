@@ -29,8 +29,8 @@ model_epoch: latest # 임의 조정
 
 seed: 99
 n_evals: 10 # 25
-goal_source: 'random_state' # 'random_state' or 'dset' or 'random_action' 
-goal_H: 5 # specifies how far away the goal is if goal_source is 'dset'
+goal_source: 'dset' # 'random_state' or 'dset' or 'random_action' 
+goal_H: 4 # specifies how far away the goal is if goal_source is 'dset'
 n_plot_samples: 10
 
 debug_dset_init: False

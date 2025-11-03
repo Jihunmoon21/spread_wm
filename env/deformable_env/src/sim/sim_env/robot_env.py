@@ -51,9 +51,31 @@ class FlexRobotHelper:
         for i in range(len(links)):
             link = links[i]
             if link.find_all('geometry'):
-                mesh_name = link.find_all('geometry')[0].find_all('mesh')[0].get('filename')
-                pyflex.add_mesh(os.path.join(robot_path_par, mesh_name), globalScaling, 0, np.ones(3), np.zeros(3), np.zeros(4), False)
-                self.num_meshes += 1
+                try:
+                    mesh_name = link.find_all('geometry')[0].find_all('mesh')[0].get('filename')
+                    mesh_path = os.path.join(robot_path_par, mesh_name)
+                    print(f"  Loading robot mesh {i+1}/{len(links)}: {mesh_name}")
+                    
+                    # Verify mesh file exists
+                    if not os.path.exists(mesh_path):
+                        print(f"  Warning: Mesh file not found: {mesh_path}")
+                        self.has_mesh[i] = False
+                        continue
+                    
+                    # Add mesh with error handling
+                    pyflex.add_mesh(mesh_path, globalScaling, 0, np.ones(3), np.zeros(3), np.zeros(4), False)
+                    print(f"  ✓ Mesh {i+1} added successfully")
+                    self.num_meshes += 1
+                    
+                    # Small delay between mesh additions to allow GPU to process
+                    if i < len(links) - 1:  # Don't delay after last mesh
+                        import time
+                        time.sleep(0.01)  # 10ms delay
+                except Exception as e:
+                    print(f"  ✗ Error loading mesh {i+1} ({mesh_name}): {e}")
+                    import traceback
+                    traceback.print_exc()
+                    self.has_mesh[i] = False
             else:
                 self.has_mesh[i] = False
         
