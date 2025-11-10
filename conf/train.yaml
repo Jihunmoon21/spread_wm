@@ -42,7 +42,7 @@ training:
   action_encoder_lr: 5e-4
 
 img_size: 224 # should be a multiple of 224
-frameskip: 5
+frameskip: 1
 concat_dim: 1
 
 normalize_action: True
@@ -55,7 +55,7 @@ num_action_repeat: 1
 proprio_emb_dim: 10 
 num_proprio_repeat: 1
 
-num_hist: 3
+num_hist: 1
 num_pred: 1 # only supports 1
 has_predictor: True # set this to False for only training a decoder
 has_decoder: False # set this to False for only training a predictor

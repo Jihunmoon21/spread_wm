@@ -26,6 +26,8 @@ class FlexEnv(gym.Env):
         super().__init__()
 
         self.dataset_config = config["dataset"]
+        # Flag to track if set_states has been called for the first time
+        self._first_set_states = True
 
         # env component
         self.obj = self.dataset_config["obj"]
@@ -121,6 +123,17 @@ class FlexEnv(gym.Env):
         self.imgs_list = []
         self.particle_pos_list = []
         self.eef_states_list = []
+
+        # Limit recentering: allow only first three calls per planning session
+        # This counter persists across resets
+        if not hasattr(self, "_recentering_calls"):
+            self._recentering_calls = 0
+        # Global guard across processes/instances within same interpreter
+        if not hasattr(FlexEnv, "_global_recentering_calls"):
+            FlexEnv._global_recentering_calls = 0
+        # 전역 카운터: 전체 planning 세션에서 초기 상태 설정 시 최대 3번까지 재센터링
+        if not hasattr(FlexEnv, "_global_first_set_states_count"):
+            FlexEnv._global_first_set_states_count = 0
 
         self.fps = self.dataset_config["fps"]
         self.fps_number = self.dataset_config["fps_number"]
@@ -390,9 +403,29 @@ class FlexEnv(gym.Env):
         center = np.array([0.0, 0.0, 0.0])
         quats = quatFromAxisAngle(axis=np.array([0.0, 1.0, 0.0]), angle=0.0)
         hideShape = 0
-        color = np.ones(3) * (160.0 / 255.0)
+        # color = np.ones(3) * (160.0 / 255.0) # 환경 변화 color = np.ones(3) * (160.0 / 255.0)
+        # color = np.array([0.0, 0.4, 0.0], dtype=np.float32) # dark green
+        # color = np.array([0.5, 0.0, 0.5], dtype=np.float32) # purple
+        # color = np.array([1.0, 1.0, 0.0], dtype=np.float32) # yellow
+        color = np.array([0.6, 0.4, 0.2], dtype=np.float32) # brown
+        # color = np.array([0.8, 0.0, 0.0], dtype=np.float32) # red
         pyflex.add_box(halfEdge, center, quats, hideShape, color)
         self.table_shape_states[0] = np.concatenate([center, center, quats, quats])
+        
+        # DEBUG: Print workspace table xy (xz plane) corner coordinates
+        # Table is a box with center and halfEdge, so corners are center ± halfEdge
+        # xz plane corners (y = center.y = 0.0, table top is at y = center.y + halfEdge.y = 0.5)
+        table_x_min = center[0] - halfEdge[0]  # x - width
+        table_x_max = center[0] + halfEdge[0]  # x + width
+        table_z_min = center[2] - halfEdge[2]  # z - length
+        table_z_max = center[2] + halfEdge[2]  # z + length
+        print(f"[DEBUG] Workspace table xz plane corners (y=0.0, table top at y={center[1] + halfEdge[1]:.2f}):")
+        print(f"  Corner 1 (SW): ({table_x_min:.2f}, {center[1]:.2f}, {table_z_min:.2f})")
+        print(f"  Corner 2 (SE): ({table_x_max:.2f}, {center[1]:.2f}, {table_z_min:.2f})")
+        print(f"  Corner 3 (NE): ({table_x_max:.2f}, {center[1]:.2f}, {table_z_max:.2f})")
+        print(f"  Corner 4 (NW): ({table_x_min:.2f}, {center[1]:.2f}, {table_z_max:.2f})")
+        print(f"  Table center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
+        print(f"  Table size: width={2*halfEdge[0]:.2f}, length={2*halfEdge[2]:.2f}, height={2*halfEdge[1]:.2f}")
 
         # table for robot
         if self.obj in ["cloth"]:
@@ -405,9 +438,27 @@ class FlexEnv(gym.Env):
         center = np.array([-self.wkspace_width - robot_table_width, 0.0, 0.0])
         quats = quatFromAxisAngle(axis=np.array([0.0, 1.0, 0.0]), angle=0.0)
         hideShape = 0
-        color = np.ones(3) * (160.0 / 255.0)
+        # color = np.ones(3) * (160.0 / 255.0) # 환경 변화 color = np.ones(3) * (160.0 / 255.0)
+        # color = np.array([0.0, 0.4, 0.0], dtype=np.float32) # dark green
+        # color = np.array([0.5, 0.0, 0.5], dtype=np.float32) # purple
+        # color = np.array([1.0, 1.0, 0.0], dtype=np.float32) # yellow
+        color = np.array([0.6, 0.4, 0.2], dtype=np.float32) # brown
+        # color = np.array([0.8, 0.0, 0.0], dtype=np.float32) # red
         pyflex.add_box(halfEdge, center, quats, hideShape, color)
         self.table_shape_states[1] = np.concatenate([center, center, quats, quats])
+        
+        # DEBUG: Print robot table xy (xz plane) corner coordinates
+        robot_table_x_min = center[0] - halfEdge[0]
+        robot_table_x_max = center[0] + halfEdge[0]
+        robot_table_z_min = center[2] - halfEdge[2]
+        robot_table_z_max = center[2] + halfEdge[2]
+        print(f"[DEBUG] Robot table xz plane corners (y=0.0, table top at y={center[1] + halfEdge[1]:.2f}):")
+        print(f"  Corner 1 (SW): ({robot_table_x_min:.2f}, {center[1]:.2f}, {robot_table_z_min:.2f})")
+        print(f"  Corner 2 (SE): ({robot_table_x_max:.2f}, {center[1]:.2f}, {robot_table_z_min:.2f})")
+        print(f"  Corner 3 (NE): ({robot_table_x_max:.2f}, {center[1]:.2f}, {robot_table_z_max:.2f})")
+        print(f"  Corner 4 (NW): ({robot_table_x_min:.2f}, {center[1]:.2f}, {robot_table_z_max:.2f})")
+        print(f"  Robot table center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
+        print(f"  Robot table size: width={2*halfEdge[0]:.2f}, length={2*halfEdge[2]:.2f}, height={2*halfEdge[1]:.2f}")
 
     def add_robot(self):
         if self.obj in ["granular"]:
@@ -559,7 +610,7 @@ class FlexEnv(gym.Env):
         self.reset_robot()
 
         # initial render
-        for _ in range(200):
+        for _ in range(10):
             pyflex.step()
 
         # save initial rendering
@@ -572,7 +623,9 @@ class FlexEnv(gym.Env):
         return out_data
 
     ### reset env
-    def reset(self, save_data=False):
+    def reset(self, save_data=False, force_recenter=False):
+        # Reset the flag so that set_states will recenter on first call after reset
+        self._first_set_states = True
         pyflex.set_shape_states(
             self.robot_to_shape_states(
                 pyflex.getRobotShapeStates(self.flex_robot_helper)
@@ -600,9 +653,23 @@ class FlexEnv(gym.Env):
                 dof_idx += 1
         self.reset_robot()
 
-        # initial render
-        for _ in range(200):
+        # initial render / stabilization
+        for _ in range(50):
             pyflex.step()
+        # 🔧 final output 계산 시에만 재센터링 (force_recenter 파라미터 또는 플래그 확인)
+        # 일반적인 reset()에서는 재센터링하지 않음
+        # 파라미터로 전달된 force_recenter를 우선 사용, 없으면 플래그 확인
+        if not force_recenter:
+            force_recenter = getattr(self, '_force_recenter_after_set_states', False)
+        # 디버깅: 플래그 값과 타입 확인
+        flag_value = getattr(self, '_force_recenter_after_set_states', None)
+        print(f"[DEBUG] reset() - force_recenter param={force_recenter}, flag={flag_value}, final_decision={force_recenter}")
+        if force_recenter:
+            print(f"[DEBUG] reset() - force_recenter is True, will recenter after stabilization")
+            self._recenter_particles_xz()
+            print(f"[DEBUG] reset() - Recentering completed")
+        else:
+            print(f"[DEBUG] reset() - force_recenter is False, skipping recentering")
 
         # save initial rendering
         if save_data:
@@ -893,6 +960,7 @@ class FlexEnv(gym.Env):
 
                 # Always flip vertically so that origin is at the top-left for image consumers
                 out = np.flip(out, axis=0).copy()
+                out = np.flip(out, axis=1).copy()
                 return out
             except ValueError:
                 # Reshape failed - return what we can and still flip vertically
@@ -903,6 +971,7 @@ class FlexEnv(gym.Env):
                     out = np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
                     out.flat[:render_result.size] = render_result.flatten()
                 out = np.flip(out, axis=0).copy()
+                out = np.flip(out, axis=1).copy()
                 return out
                     
         except Exception as e:
@@ -1051,6 +1120,43 @@ class FlexEnv(gym.Env):
     def set_positions(self, positions):
         pyflex.set_positions(positions)
 
+    def _recenter_particles_xz(self):
+        """Translate particles so that their xz center is at (0, 0)."""
+        try:
+            # Skip recentering after it has already run three times
+            if (
+                hasattr(self, "_recentering_calls") and self._recentering_calls >= 9
+            ) or (
+                hasattr(FlexEnv, "_global_recentering_calls")
+                and FlexEnv._global_recentering_calls >= 9
+            ):
+                return
+            pos = pyflex.get_positions()
+            if pos is None or len(pos) == 0:
+                return
+            pos4 = pos.reshape(-1, 4)
+            x_min, x_max = pos4[:, 0].min(), pos4[:, 0].max()
+            z_min, z_max = pos4[:, 2].min(), pos4[:, 2].max()
+            cx = 0.5 * (x_min + x_max)
+            cz = 0.5 * (z_min + z_max)
+            if abs(cx) <= 1e-6 and abs(cz) <= 1e-6:
+                return
+            pos4[:, 0] -= cx
+            pos4[:, 2] -= cz
+            pyflex.set_positions(pos4.reshape(-1))
+            pos_after = pyflex.get_positions().reshape(-1, 4)
+            ax_min, ax_max = pos_after[:, 0].min(), pos_after[:, 0].max()
+            az_min, az_max = pos_after[:, 2].min(), pos_after[:, 2].max()
+            print(f"[DEBUG] After recenter x=[{ax_min:.2f}, {ax_max:.2f}], z=[{az_min:.2f}, {az_max:.2f}]")
+            # Count successful recentering executions
+            if hasattr(self, "_recentering_calls"):
+                self._recentering_calls += 1
+            if hasattr(FlexEnv, "_global_recentering_calls"):
+                FlexEnv._global_recentering_calls += 1
+        except Exception as e:
+            print(f"[DEBUG] Recentering failed: {e}")
+
+
     def get_num_particles(self):
         return self.get_positions().reshape(-1, 4).shape[0]
 
@@ -1060,10 +1166,27 @@ class FlexEnv(gym.Env):
     def get_states(self):
         return self.get_positions().reshape(-1, 4)
 
-    def set_states(self, states):
+    def set_states(self, states, force_recenter=False):
         if states is not None:
             # self.scene.set_scene(self.obj)
             pyflex.set_positions(states)
+            # 🔧 재센터링 조건:
+            # 1. force_recenter=True (final output에서만)
+            # 2. _first_set_states=True AND _global_first_set_states_count < 3 (초기 상태 설정 시 전체 세션에서 최대 3번까지)
+            should_recenter = False
+            if force_recenter:
+                should_recenter = True
+                print(f"[DEBUG] set_states() - force_recenter=True, calling _recenter_particles_xz()")
+            elif self._first_set_states and FlexEnv._global_first_set_states_count < 5:
+                should_recenter = True
+                FlexEnv._global_first_set_states_count += 1
+                print(f"[DEBUG] set_states() - _first_set_states=True (initial state, count={FlexEnv._global_first_set_states_count}/3), calling _recenter_particles_xz()")
+            
+            if should_recenter:
+                self._recenter_particles_xz()
+            # _first_set_states 플래그 리셋 (한 번만 실행되도록)
+            if self._first_set_states:
+                self._first_set_states = False
 
     def seed(self, seed):
         np.random.seed(seed)

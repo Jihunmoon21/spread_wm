@@ -1,11 +1,11 @@
 dataset:
   obj: "granular"
   obj_params:
-    granular_scale: 0.2
-    area: 5.0 # change particle numbers
+    granular_scale: 0.1 # 0.2
+    area: 1.5 # change particle numbers
     # area: 1.5
     xz_ratio: 1.0
-    granular_dis: 0.03
+    granular_dis: 0.03 # 0.15
 
   # data collection
   base: 0
@@ -14,15 +14,15 @@ dataset:
   n_worker: 40
   
   # sim env
-  headless: False # False: OpenGL visualization
-  camera_view: 1 # 0 (top view), 1, 2, 3, 4
+  headless: true # False: OpenGL visualization
+  camera_view: 1 # 0 (top view), 1, 2, 3, 4 # 환경 변화
   screenWidth: 224 # 224
   screenHeight: 224 # 224
 
   robot_type: 'xarm6' 
   robot_end_idx: 6
   robot_num_dofs: 6
-  robot_speed_inv: 300
+  robot_speed_inv: 50
   
   action_dim: 4 # [x_start, z_start, x_end, z_end]
   action_space: 4 # random action space scope

@@ -83,6 +83,9 @@ class CEMPlanner(BasePlanner):
         mu, sigma = self.init_mu_sigma(obs_0, actions)
         mu, sigma = mu.to(self.device), sigma.to(self.device)
         n_evals = mu.shape[0]
+        
+        # 각 trajectory에 대한 best loss 추적 (CD가 증가하는 행동 제외용)
+        best_losses = [float('inf')] * n_evals
 
         for i in range(self.opt_steps):
             print(f"CEM Step {i+1}/{self.opt_steps}")
@@ -116,9 +119,38 @@ class CEMPlanner(BasePlanner):
                     )
 
                 loss = self.objective_fn(i_z_obses, cur_z_obs_g)
-                topk_idx = torch.argsort(loss)[: self.topk]
-                topk_action = action[topk_idx]
-                losses.append(loss[topk_idx[0]].item())
+                
+                # CD가 증가하는 행동 제외: 현재 best보다 나쁜 행동 필터링
+                if best_losses[traj] < float('inf'):
+                    # 현재 best보다 좋거나 같은 행동만 선택
+                    valid_mask = loss <= best_losses[traj]
+                    if valid_mask.sum() > 0:
+                        # 유효한 행동들 중에서만 topk 선택
+                        valid_loss = loss[valid_mask]
+                        valid_action = action[valid_mask]
+                        valid_indices = torch.where(valid_mask)[0]
+                        
+                        # 유효한 행동이 topk보다 적으면 모두 사용, 많으면 topk만 선택
+                        k = min(self.topk, valid_loss.shape[0])
+                        topk_idx_in_valid = torch.argsort(valid_loss)[:k]
+                        topk_idx = valid_indices[topk_idx_in_valid]
+                        topk_action = valid_action[topk_idx_in_valid]
+                    else:
+                        # 모든 행동이 나쁘면 기존 best 유지 (mu, sigma 업데이트 안 함)
+                        print(f"[CEM] Traj {traj}: All actions worse than best (best_loss={best_losses[traj]:.4f}), keeping previous best")
+                        losses.append(best_losses[traj])
+                        continue
+                else:
+                    # 첫 iteration: 기존 로직 사용
+                    topk_idx = torch.argsort(loss)[: self.topk]
+                    topk_action = action[topk_idx]
+                
+                # Best loss 업데이트
+                current_best_loss = loss[topk_idx[0]].item()
+                if current_best_loss < best_losses[traj]:
+                    best_losses[traj] = current_best_loss
+                
+                losses.append(current_best_loss)
                 # 아래 두 줄 삭제하면 cem 작동 안 함
                 mu[traj] = topk_action.mean(dim=0)
                 sigma[traj] = topk_action.std(dim=0)

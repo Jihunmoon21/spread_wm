@@ -382,15 +382,23 @@ class EnsembleOnlineLora:
     
     def update(self, trans_obs_0, actions, e_obses):
         """
-        하나의 학습 단계를 수행하는 메인 메소드
+        하나의 학습 단계를 수행하는 메인 메소드 (시간 측정 포함)
         
         Args:
             trans_obs_0: 변환된 초기 관측
             actions: 행동 시퀀스
             e_obses: 실제 관측 시퀀스
         """
+        start_time = time.time()
         # 기존 OnlineLora의 학습 로직 사용 (반환값 없음, 내부적으로 last_loss 설정)
         self.base_online_lora.update(trans_obs_0, actions, e_obses)
+        adaptation_time = time.time() - start_time
+        print(f"Ensemble LoRA adaptation time: {adaptation_time:.4f} seconds")
+        
+        # 🔧 adaptation time 저장 (base_online_lora에 이미 저장되지만, Ensemble 레벨에서도 추적)
+        if not hasattr(self, 'adaptation_times'):
+            self.adaptation_times = []
+        self.adaptation_times.append(adaptation_time)
         
         # 🔧 모든 상태 동기화 (base_online_lora에서 설정된 값 사용)
         self.last_loss = self.base_online_lora.last_loss
@@ -475,15 +483,20 @@ class EnsembleOnlineLora:
             print("--- Starting Ensemble LoRA Online Learning ---")
             
             # 1. 예측 (그래디언트 활성화)
+            step_start = time.time()
             i_z_obses_pred, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions)
+            rollout_time = time.time() - step_start
 
             # 2. 정답 준비 (그래디언트 비활성화)
+            encode_start = time.time()
             with torch.no_grad():
                 trans_obs_gt = self.workspace.data_preprocessor.transform_obs(e_obses)
                 trans_obs_gt = move_to_device(trans_obs_gt, self.device)
                 i_z_obses_gt = self.wm.encode_obs(trans_obs_gt)
+            encode_time = time.time() - encode_start
 
             # 3. 손실 계산
+            loss_start = time.time()
             print("Computing ensemble loss...")
             frameskip = self.workspace.frameskip
             gt_proprio_resampled = i_z_obses_gt["proprio"][:, ::frameskip, :].detach()
@@ -493,11 +506,13 @@ class EnsembleOnlineLora:
             visual_loss = self.loss_fn(i_z_obses_pred["visual"], gt_visual_resampled)
             
             total_loss = self.visual_loss_weight * visual_loss + self.proprio_loss_weight * proprio_loss
+            loss_time = time.time() - loss_start
             
             print(f"Visual loss: {visual_loss.item():.6f}, Proprio loss: {proprio_loss.item():.6f}")
             print(f"Total loss: {total_loss.item():.6f}")
 
             # 4. 역전파 및 업데이트
+            backward_start = time.time()
             if self.optimizer is None:
                 # 첫 번째 학습 시 옵티마이저 초기화
                 params_to_train = [p for p in self.wm.parameters() if p.requires_grad]
@@ -506,6 +521,9 @@ class EnsembleOnlineLora:
             self.optimizer.zero_grad()
             total_loss.backward()
             self.optimizer.step()
+            backward_time = time.time() - backward_start
+            
+            print(f"Ensemble LoRA step timing - Rollout: {rollout_time:.4f}s, Encode: {encode_time:.4f}s, Loss: {loss_time:.4f}s, Backward: {backward_time:.4f}s")
 
             return total_loss.item()
 

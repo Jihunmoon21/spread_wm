@@ -44,6 +44,11 @@ class FlexScene:
             # Debug: Print scene parameters before setting
             print(f"Setting granular scene with {len(scene_params_f32)} parameters")
             print(f"First few params: {scene_params_f32[:10]}")
+            try:
+                cx, cy, cz = float(scene_params_f32[5]), float(scene_params_f32[6]), float(scene_params_f32[7])
+                print(f"[SCENE DEBUG] pos_granular(center) to C++: ({cx:.3f}, {cy:.3f}, {cz:.3f})")
+            except Exception as _:
+                pass
             
             # Verify no NaN or Inf values
             if np.any(np.isnan(scene_params_f32)) or np.any(np.isinf(scene_params_f32)):

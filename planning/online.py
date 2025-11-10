@@ -83,6 +83,9 @@ class OnlineLora:
         
         # LoRA 적층 콜백 함수 (태스크 추적을 위해)
         self.on_lora_stack_callback = None
+        
+        # 🔧 LoRA adaptation time 추적 (최종 결과 출력용)
+        self.adaptation_times = []
 
 
     def update(self, trans_obs_0, actions, e_obses):
@@ -90,7 +93,13 @@ class OnlineLora:
         하나의 학습 단계를 수행하는 메인 메소드. PlanEvaluator로부터 호출됩니다.
         """
         # 학습 단계 수행 (예측, 손실 계산, 역전파, 업데이트)
+        start_time = time.time()
         total_loss_value = self._perform_training_step(trans_obs_0, actions, e_obses)
+        adaptation_time = time.time() - start_time
+        print(f"LoRA adaptation time: {adaptation_time:.4f} seconds")
+        
+        # 🔧 adaptation time 저장 (최종 결과 출력용)
+        self.adaptation_times.append(adaptation_time)
         
         # 마지막 Loss 값 저장 (태스크 전환을 위해)
         if total_loss_value is not None:
@@ -112,15 +121,20 @@ class OnlineLora:
             print("--- Starting LoRA Online Learning ---")
             
             # 1. 예측 (그래디언트 활성화)
+            step_start = time.time()
             i_z_obses_pred, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions)
+            rollout_time = time.time() - step_start
 
             # 2. 정답 준비 (그래디언트 비활성화)
+            encode_start = time.time()
             with torch.no_grad():
                 trans_obs_gt = self.workspace.data_preprocessor.transform_obs(e_obses)
                 trans_obs_gt = move_to_device(trans_obs_gt, self.device)
                 i_z_obses_gt = self.wm.encode_obs(trans_obs_gt)
+            encode_time = time.time() - encode_start
 
             # 3. 손실 계산
+            loss_start = time.time()
             print("Computing loss...")
             frameskip = self.workspace.frameskip
             gt_proprio_resampled = i_z_obses_gt["proprio"][:, ::frameskip, :].detach()
@@ -130,14 +144,19 @@ class OnlineLora:
             visual_loss = self.loss_fn(i_z_obses_pred["visual"], gt_visual_resampled)
             
             total_loss = self.visual_loss_weight * visual_loss + self.proprio_loss_weight * proprio_loss
+            loss_time = time.time() - loss_start
             
             print(f"Visual loss: {visual_loss.item():.6f}, Proprio loss: {proprio_loss.item():.6f}")
             print(f"Total loss: {total_loss.item():.6f}")
 
             # 4. 역전파 및 업데이트
+            backward_start = time.time()
             self.optimizer.zero_grad()
             total_loss.backward()
             self.optimizer.step()
+            backward_time = time.time() - backward_start
+            
+            print(f"LoRA step timing - Rollout: {rollout_time:.4f}s, Encode: {encode_time:.4f}s, Loss: {loss_time:.4f}s, Backward: {backward_time:.4f}s")
 
             return total_loss.item()
 

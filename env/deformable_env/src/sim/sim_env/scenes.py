@@ -108,7 +108,7 @@ def rope_scene(obj_params):
 
 
 def granular_scene(obj_params):
-    radius = 0.03
+    radius = 0.15
     # print(1/0)
 
     # granular_scale = rand_float(0.1, 0.3)
@@ -130,30 +130,44 @@ def granular_scene(obj_params):
     # granular_dis = rand_float(0.1 * granular_scale, 0.2 * granular_scale)
     granular_dis = obj_params["granular_dis"]
 
-    num_granular_ft_x = (x_max - x_min - granular_scale) / (
-        granular_dis + granular_scale
-    ) + 1
-    num_granular_ft_z = (z_max - z_min - granular_scale) / (
-        granular_dis + granular_scale
-    ) + 1
+    # Calculate grid dimensions, but allow override from obj_params for exact particle count
+    if "num_granular_ft_x" in obj_params and "num_granular_ft_z" in obj_params:
+        # Direct specification for exact particle count
+        num_granular_ft_x = int(obj_params["num_granular_ft_x"])
+        num_granular_ft_z = int(obj_params["num_granular_ft_z"])
+    else:
+        # Calculate from area and spacing (default behavior)
+        num_granular_ft_x = (x_max - x_min - granular_scale) / (
+            granular_dis + granular_scale
+        ) + 1
+        num_granular_ft_z = (z_max - z_min - granular_scale) / (
+            granular_dis + granular_scale
+        ) + 1
+        # Ensure these are integers, not floats
+        num_granular_ft_x = int(num_granular_ft_x)
+        num_granular_ft_z = int(num_granular_ft_z)
+    
+    # Override to achieve exactly 81 particles (9x9x1 grid)
+    num_granular_ft_x = 9
+    num_granular_ft_z = 9
 
     # shape
     shape_type = 0  # 0: irreular shape; 1: regular shape
-    shape_min_dist = 5.0  # 5. for irregular shape; 8 for regulra shape
+    shape_min_dist = 6.0  # 5. for irregular shape; 8 for regulra shape
     shape_max_dist = 10.0
 
     num_granular_ft_y = 1
     # Ensure these are integers, not floats
-    num_granular_ft_x = int(num_granular_ft_x)
     num_granular_ft_y = int(num_granular_ft_y)
-    num_granular_ft_z = int(num_granular_ft_z)
     num_granular_ft = [num_granular_ft_x, num_granular_ft_y, num_granular_ft_z]
     num_granular = int(num_granular_ft_x * num_granular_ft_y * num_granular_ft_z)
 
     print(f"NUM_GRANULAR: {num_granular}")
     print(f"num_granular_ft: {num_granular_ft}")
 
-    pos_granular = [-1.0, 1.0, -1.0]
+    # Pass the CENTER position to PyFleX (C++ converts center -> lower using final spacing)
+    # Table center is (0, 0) in xz; y is above the table top
+    pos_granular = [0.0, 1.0, 0.0]
 
     draw_mesh = 1
 

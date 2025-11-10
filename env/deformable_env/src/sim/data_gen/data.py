@@ -44,7 +44,7 @@ def process_imgs(imgs_list):
 
     for cam_idx in range(n_cam):
         img = imgs_list[:, cam_idx]  # (T, H, W, 5)
-        color_imgs[f"cam_{cam_idx}"] = img[:, :, :, :3][..., ::-1]  # (T, H, W, 3)
+        color_imgs[f"cam_{cam_idx}"] = img[:, :, :, :3]  # (T, H, W, 3) RGB format
         depth_imgs[f"cam_{cam_idx}"] = (img[:, :, :, -1] * 1000).astype(
             np.uint16
         )  # (T, H, W)

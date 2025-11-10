@@ -4,5 +4,5 @@ outputs
 plan_outputs
 checkpoints
 data
-LIBERO/libero/datasets
-softgym/
+softgym
+PyFleX

@@ -85,7 +85,10 @@ class MPCPlanner(BasePlanner):
 
         cur_obs_0 = obs_0
         memo_actions = None
-        while not np.all(self.is_success) and self.iter < self.max_iter:
+        # 실제 환경 기준 CD 추적 (CD 증가 행동 거르기)
+        prev_cd = None  # 이전 iteration의 CD 저장
+        # 🔧 임시: 성공 여부와 관계없이 max_iter까지 수행
+        while self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
             
             # 🔧 MPC에서는 일반 플래닝 사용 (앙상블은 태스크 전환 시에만 사용)
@@ -100,11 +103,12 @@ class MPCPlanner(BasePlanner):
             self.planned_actions.append(taken_actions)
 
             print(f"MPC iter {self.iter} Eval ------- ")
-            action_so_far = torch.cat(self.planned_actions, dim=1)
-            
-            # 🔧 수정: 첫 번째 iteration에서만 초기 조건 설정
+            # 🔧 각 iteration에서는 새로 추가된 action만 평가 (현재 상태에서 시작)
+            # 첫 번째 iteration에서만 초기 조건 설정
             if self.iter == 0:
                 print(f"[MPC FIX] Setting initial conditions for iter {self.iter}")
+                # Reset the flag for initial CD measurement
+                self.evaluator._initial_cd_measured = False
                 self.evaluator.assign_init_cond(
                     obs_0=init_obs_0,
                     state_0=init_state_0,
@@ -112,12 +116,49 @@ class MPCPlanner(BasePlanner):
             else:
                 print(f"[MPC FIX] Using updated conditions from previous iter for iter {self.iter}")
             
+            # 새로 추가된 action만 평가 (현재 환경 상태에서 시작)
             logs, successes, e_obses, e_states = self.evaluator.eval_actions(
-                action_so_far,
+                taken_actions,  # 전체 action_so_far가 아닌 새로 추가된 action만
                 self.action_len,
                 filename=f"{self.logging_prefix}_plan{self.iter}",
                 save_video=True,
             )
+            # ---- CD 증가 행동 차단 로직 ----
+            # evaluator 로그에서 mean_chamfer_distance 추출
+            cur_cd = logs.get("mean_chamfer_distance", None)
+            if cur_cd is None:
+                # fallback: chamfer_distance 직접 확인
+                cur_cd = logs.get("chamfer_distance", None)
+            if cur_cd is not None:
+                # 스칼라 값이면 배열로 변환
+                if not isinstance(cur_cd, (list, tuple, np.ndarray)):
+                    cur_cd = np.array([cur_cd])
+                elif isinstance(cur_cd, (list, tuple)):
+                    cur_cd = np.array(cur_cd)
+                # 첫 번째 iteration이 아니고, 이전 CD가 있는 경우에만 비교
+                if prev_cd is not None:
+                    # 현재 CD가 이전 CD보다 나쁜 경우 (증가)
+                    if np.any(cur_cd > prev_cd):
+                        print(
+                            f"[MPC] CD increased: prev={prev_cd}, cur={cur_cd}. Reverting this step."
+                        )
+                        # 방금 추가한 행동 취소
+                        if len(self.planned_actions) > 0:
+                            self.planned_actions.pop()
+                        # memo_actions도 이전 상태로 되돌리기 (다음 계획을 위해)
+                        memo_actions = None
+                        # iter는 증가시키되, 상태 업데이트 없이 다음 반복으로 진행
+                        self.iter += 1
+                        print(f"[MPC] Iter {self.iter} (reverted due to CD increase)\n")
+                        continue
+                    else:
+                        # 개선 또는 동일: prev_cd 업데이트
+                        prev_cd = cur_cd.copy()
+                        print(f"[MPC] CD improved or same: {cur_cd[0]:.6f}")
+                else:
+                    # 첫 번째 iteration: prev_cd 초기화
+                    prev_cd = cur_cd.copy()
+                    print(f"[MPC] Initial CD: {cur_cd[0]:.6f}")
             new_successes = successes & ~self.is_success  # Identify new successes
             self.is_success = (
                 self.is_success | successes
@@ -147,12 +188,63 @@ class MPCPlanner(BasePlanner):
         # 최종 결과 반환
         planned_actions = torch.cat(self.planned_actions, dim=1)
         
-        
-        # 평가자를 원래 상태로 복원
+        # 🔧 final output: 초기 상태에서 전체 궤적(action_so_far) 평가
+        print("[MPC] Evaluating final output from initial state with full trajectory")
         self.evaluator.assign_init_cond(
             obs_0=init_obs_0,
             state_0=init_state_0,
         )
+        # 전체 궤적을 초기 상태에서 평가
+        final_logs, final_successes, final_e_obses, final_e_states = self.evaluator.eval_actions(
+            planned_actions,  # 전체 궤적
+            self.action_len,
+            filename="output_final",
+            save_video=True,
+        )
+        print(f"[MPC] Final output CD: {final_logs.get('mean_chamfer_distance', final_logs.get('chamfer_distance', 'N/A'))}")
+        
+        # 🔧 최종 결과 요약 출력
+        print("\n" + "="*80)
+        print("[MPC] Final Results Summary")
+        print("="*80)
+        
+        # Steps to Success 계산
+        success_mask = self.is_success
+        if np.any(success_mask):
+            steps_to_success = self.action_len[success_mask]
+            print(f"Steps to Success: {steps_to_success.tolist()}")
+            print(f"  - Mean: {np.mean(steps_to_success):.2f}")
+            print(f"  - Min: {np.min(steps_to_success):.2f}")
+            print(f"  - Max: {np.max(steps_to_success):.2f}")
+        else:
+            print("Steps to Success: N/A (no successful trajectories)")
+        
+        # LoRA Adaptation Time 통계
+        if hasattr(self.evaluator, 'workspace') and self.evaluator.workspace is not None:
+            if hasattr(self.evaluator.workspace, 'online_learner') and self.evaluator.workspace.online_learner is not None:
+                online_learner = self.evaluator.workspace.online_learner
+                # EnsembleOnlineLora인 경우 base_online_lora에서 가져오기 (더 정확한 값)
+                if hasattr(online_learner, 'base_online_lora'):
+                    adaptation_times = online_learner.base_online_lora.adaptation_times
+                elif hasattr(online_learner, 'adaptation_times'):
+                    adaptation_times = online_learner.adaptation_times
+                else:
+                    adaptation_times = []
+                
+                if len(adaptation_times) > 0:
+                    print(f"\nLoRA Adaptation Time (total {len(adaptation_times)} updates):")
+                    print(f"  - Min: {min(adaptation_times):.4f} seconds")
+                    print(f"  - Max: {max(adaptation_times):.4f} seconds")
+                    print(f"  - Mean: {np.mean(adaptation_times):.4f} seconds")
+                    print(f"  - Total: {sum(adaptation_times):.4f} seconds")
+                else:
+                    print("\nLoRA Adaptation Time: N/A (no LoRA updates performed)")
+            else:
+                print("\nLoRA Adaptation Time: N/A (LoRA not enabled)")
+        else:
+            print("\nLoRA Adaptation Time: N/A (workspace not available)")
+        
+        print("="*80 + "\n")
 
         return planned_actions, self.action_len
 

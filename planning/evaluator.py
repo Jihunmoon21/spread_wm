@@ -45,6 +45,7 @@ class PlanEvaluator:  # evaluator for planning
         self.device = next(wm.parameters()).device
 
         self.plot_full = False  # plot all frames or frames after frameskip
+        self._initial_cd_measured = False  # Flag to track if initial CD has been measured
 
         # lora 학습을 위한 관련 설정 초기화
         self.workspace = workspace  # PlanWorkspace 인스턴스 참조
@@ -149,11 +150,119 @@ class PlanEvaluator:  # evaluator for planning
         )
         exec_actions = self.preprocessor.denormalize_actions(exec_actions).numpy()
 
-        e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions)
+        # 🔧 final output 계산 시 재센터링 강제 적용
+        if filename == "output_final":
+            print("[EVAL] Setting force_recenter flag for final output - will recenter in reset() and set_states()")
+            # 재센터링 카운터 리셋하여 final output에서 재센터링이 적용되도록 함
+            if hasattr(self.env, 'workers'):
+                # SubprocVectorEnv or similar - has workers
+                for env_worker in self.env.workers:
+                    if hasattr(env_worker, 'env') and hasattr(env_worker.env, 'env'):
+                        env = env_worker.env.env
+                        if hasattr(env, '_recentering_calls'):
+                            env._recentering_calls = 0
+                        if hasattr(env.__class__, '_global_recentering_calls'):
+                            env.__class__._global_recentering_calls = 0
+                        # force_recenter 플래그 설정
+                        env._force_recenter_after_set_states = True
+                        print(f"[EVAL] Set _force_recenter_after_set_states=True for worker env")
+            elif hasattr(self.env, 'envs') and len(self.env.envs) > 0:
+                # SerialVectorEnv - envs is a list of FlexEnvWrapper instances
+                for env_wrapper in self.env.envs:
+                    # env_wrapper itself is FlexEnvWrapper
+                    if hasattr(env_wrapper, '_recentering_calls'):
+                        env_wrapper._recentering_calls = 0
+                    if hasattr(env_wrapper.__class__, '_global_recentering_calls'):
+                        env_wrapper.__class__._global_recentering_calls = 0
+                    # force_recenter 플래그 설정 - FlexEnvWrapper에 직접 설정
+                    env_wrapper._force_recenter_after_set_states = True
+                    # 또한 내부 FlexEnv에도 설정 (reset()에서 사용)
+                    if hasattr(env_wrapper, 'env'):
+                        env_wrapper.env._force_recenter_after_set_states = True
+                    print(f"[EVAL] Set _force_recenter_after_set_states=True for SerialVectorEnv wrapper and inner FlexEnv")
+            elif hasattr(self.env, 'env'):
+                # Single environment (FlexEnvWrapper)
+                env = self.env.env
+                if hasattr(env, '_recentering_calls'):
+                    env._recentering_calls = 0
+                if hasattr(env.__class__, '_global_recentering_calls'):
+                    env.__class__._global_recentering_calls = 0
+                # force_recenter 플래그 설정 - FlexEnvWrapper에 직접 설정
+                env._force_recenter_after_set_states = True
+                # 또한 내부 FlexEnv에도 설정 (reset()에서 사용)
+                if hasattr(env, 'env'):
+                    env.env._force_recenter_after_set_states = True
+                print(f"[EVAL] Set _force_recenter_after_set_states=True for single env wrapper and inner FlexEnv")
+
+        # Set flag before rollout to measure Initial CD after first set_states in prepare()
+        if not hasattr(self, '_initial_cd_measured') or not self._initial_cd_measured:
+            # Set flags in environment to measure CD after set_states
+            if hasattr(self.env, 'envs') and len(self.env.envs) > 0:
+                # For vectorized environment, set flag in first worker
+                first_env = self.env.envs[0].env
+                if hasattr(first_env, 'set_measure_initial_cd'):
+                    first_env.set_measure_initial_cd(True, self.state_g)
+            elif hasattr(self.env, 'env'):
+                # For single environment
+                if hasattr(self.env.env, 'set_measure_initial_cd'):
+                    self.env.env.set_measure_initial_cd(True, self.state_g)
+            self._initial_cd_measured = True
+
+        # 🔧 final output인 경우 플래그를 rollout 직전에 다시 확인 및 설정
+        force_recenter_for_rollout = False
+        if filename == "output_final":
+            print("[EVAL] Re-checking force_recenter flag before rollout")
+            force_recenter_for_rollout = True
+            if hasattr(self.env, 'envs') and len(self.env.envs) > 0:
+                for i, env_wrapper in enumerate(self.env.envs):
+                    # FlexEnvWrapper에 직접 설정
+                    env_wrapper._force_recenter_after_set_states = True
+                    # 확인용 로그
+                    flag_after = getattr(env_wrapper, '_force_recenter_after_set_states', None)
+                    print(f"[EVAL] Re-set _force_recenter_after_set_states=True for env[{i}], verified={flag_after}")
+        
+        # 🔧 final output인 경우 force_recenter 파라미터를 직접 전달
+        e_obses, e_states = self.env.rollout(self.seed, self.state_0, exec_actions, force_recenter=force_recenter_for_rollout)
         # # ======================================================= #
         # LoRA 학습이 활성화된 경우, 학습 책임을 OnlineLora 객체에 위임합니다.
         if self.is_lora_enabled and self.workspace.online_learner is not None:
             self.workspace.online_learner.update(trans_obs_0, actions, e_obses)
+        else:
+            # LoRA가 비활성화되어 있어도 loss를 계산하고 출력 (로그 확인용)
+            if self.workspace is not None:
+                # 위에서 계산한 i_z_obses를 재사용
+                i_z_obses_pred = i_z_obses
+                
+                # 2. 정답 준비: 실제 환경 결과(e_obses)를 인코딩하여 '정답' 잠재 상태를 만듭니다.
+                with torch.no_grad():
+                    trans_obs_gt = self.preprocessor.transform_obs(e_obses)
+                    trans_obs_gt = move_to_device(trans_obs_gt, self.device)
+                    i_z_obses_gt = self.wm.encode_obs(trans_obs_gt)
+
+                    # 3. 손실 계산: 예측과 정답 사이의 오차(MSE Loss)를 계산합니다.
+                    print("Computing loss...")
+                    frameskip = self.frameskip
+                    gt_proprio_resampled = i_z_obses_gt["proprio"][:, ::frameskip, :]
+                    gt_visual_resampled = i_z_obses_gt["visual"][:, ::frameskip, :, :]
+                    
+                    # Loss function 가져오기
+                    if hasattr(self.workspace, 'loss_fn') and self.workspace.loss_fn is not None:
+                        loss_fn = self.workspace.loss_fn
+                    else:
+                        import torch.nn as nn
+                        loss_fn = nn.MSELoss()
+                    
+                    # 시각과 proprioceptive 손실을 각각 계산
+                    proprio_loss = loss_fn(i_z_obses_pred["proprio"], gt_proprio_resampled)
+                    visual_loss = loss_fn(i_z_obses_pred["visual"], gt_visual_resampled)
+     
+                    # 가중합으로 전체 손실 계산 (기본값 사용)
+                    visual_weight = getattr(self.workspace, 'visual_loss_weight', 1.0)
+                    proprio_weight = getattr(self.workspace, 'proprio_loss_weight', 0.3)
+                    total_loss = visual_weight * visual_loss + proprio_weight * proprio_loss
+                    
+                    print(f"Visual loss: {visual_loss.item():.6f}, Proprio loss: {proprio_loss.item():.6f}")
+                    print(f"Total loss: {total_loss.item():.6f}")
         # if self.is_lora_enabled:
         #     print("--- Starting LoRA Online Learning ---")
             

@@ -1,7 +1,9 @@
 defaults:
   - _self_
+  - env: env
   - planner: mpc_cem
   - override hydra/launcher: submitit_slurm
+
 
 hydra:
   run:
@@ -25,12 +27,12 @@ hydra:
 # model to load for planning
 ckpt_base_path: /home/jihun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: null
-model_epoch: latest # 임의 조정
+model_epoch: 1 # latest # 임의 조정
 
 seed: 99
 n_evals: 10 # 25
 goal_source: 'dset' # 'random_state' or 'dset' or 'random_action' 
-goal_H: 4 # specifies how far away the goal is if goal_source is 'dset'
+goal_H: 3 # specifies how far away the goal is if goal_source is 'dset'
 n_plot_samples: 10
 
 debug_dset_init: False
@@ -47,9 +49,9 @@ lora:
   enabled: true
   online: true
   ensemble: true                  # ← 기존 ensemble_lora.enabled 대체
-  lr: 0.0005                    # LoRA learning rate (기본값: 1e-4)
+  lr: 0.005                    # LoRA learning rate (기본값: 1e-4)
   visual_loss_weight: 1.0
-  proprio_loss_weight: 0.3
+  proprio_loss_weight: 0.5
   
   # 태스크 전환: loss 기반 전환 설정
   task_switch:

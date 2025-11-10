@@ -208,8 +208,11 @@ class PlanWorkspace:
         # optional: assume planning horizon equals to goal horizon
         from planning.mpc import MPCPlanner
         if isinstance(self.planner, MPCPlanner):
+            # Only set horizon to goal_H, but keep n_taken_actions from config
             self.planner.sub_planner.horizon = cfg_dict["goal_H"]
-            self.planner.n_taken_actions = cfg_dict["goal_H"]
+            # n_taken_actions is already set from config, don't override it
+            # self.planner.n_taken_actions = cfg_dict["goal_H"]  # Commented out to use config value
+            print(f"[DEBUG] MPC planner: n_taken_actions={self.planner.n_taken_actions}, horizon={self.planner.sub_planner.horizon}")
         else:
             self.planner.horizon = cfg_dict["goal_H"]
             

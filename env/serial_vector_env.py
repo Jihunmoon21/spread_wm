@@ -73,12 +73,13 @@ class SerialVectorEnv:
         infos = tuple(infos)
         return obses, rewards, dones, infos
 
-    def rollout(self, seed, init_state, actions):
+    def rollout(self, seed, init_state, actions, force_recenter=None):
         """
         only returns np arrays of observations and states
         obses: (num_envs, T, H, W, C)
         states: (num_envs, T, D)
         proprios: (num_envs, T, D_p)
+        force_recenter: If provided, use this value. Otherwise, check flag on each env.
         """
         obses = []
         states = []
@@ -87,7 +88,17 @@ class SerialVectorEnv:
             cur_seed = seed[i]
             cur_init_state = init_state[i]
             cur_actions = actions[i]
-            obs, state = env.rollout(cur_seed, cur_init_state, cur_actions)
+            # 🔧 final output 계산 시 플래그 확인 및 전달
+            if force_recenter is None:
+                force_recenter_env = getattr(env, '_force_recenter_after_set_states', False)
+            else:
+                force_recenter_env = force_recenter
+            if force_recenter_env:
+                print(f"[DEBUG] SerialVectorEnv.rollout() - env[{i}] has force_recenter=True, will pass to rollout()")
+                # 🔧 플래그를 명시적으로 다시 설정 (확실히 전달되도록)
+                env._force_recenter_after_set_states = True
+                print(f"[DEBUG] SerialVectorEnv.rollout() - Explicitly set _force_recenter_after_set_states=True before calling env.rollout()")
+            obs, state = env.rollout(cur_seed, cur_init_state, cur_actions, force_recenter=force_recenter_env)
             obses.append(obs)
             states.append(state)
         obses = aggregate_dct(obses)

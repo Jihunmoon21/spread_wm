@@ -530,15 +530,16 @@ class Trainer:
                         }
                         self.logs_update(img_reconstruction_scores)
 
-                self.plot_samples(
-                    obs["visual"],
-                    visual_out,
-                    visual_reconstructed,
-                    self.epoch,
-                    batch=i,
-                    num_samples=self.num_reconstruct_samples,
-                    phase="train",
-                )
+                if self.cfg.has_decoder and visual_reconstructed is not None:
+                    self.plot_samples(
+                        obs["visual"],
+                        visual_out,
+                        visual_reconstructed,
+                        self.epoch,
+                        batch=i,
+                        num_samples=self.num_reconstruct_samples,
+                        phase="train",
+                    )
 
             loss_components = {f"train_{k}": [v] for k, v in loss_components.items()}
             self.logs_update(loss_components)
@@ -772,6 +773,9 @@ class Trainer:
                 pred_imgs: (b, num_hist, 3, img_size, img_size)
         output:   imgs: (b, num_frames, 3, img_size, img_size)
         """
+        # 디코더 비활성 시 안전 가드
+        if reconstructed_gt_imgs is None:
+            return
         num_frames = gt_imgs.shape[1]
         # sample num_samples images
         gt_imgs, pred_imgs, reconstructed_gt_imgs = sample_tensors(
