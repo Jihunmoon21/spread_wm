@@ -37,8 +37,30 @@ def chamfer_distance(x, y):
     return dis_xy + dis_yx
 
 class FlexEnvWrapper(FlexEnv):
-    def __init__(self, object_name):
-        config = load_yaml(os.path.join(BASE_DIR, f'conf/env/{object_name}.yaml'))
+    def __init__(
+        self,
+        object_name,
+        *,
+        table_color=None,
+        camera_view=None,
+        granular_radius=None,
+    ):
+        config = load_yaml(os.path.join(BASE_DIR, f"conf/env/{object_name}.yaml"))
+
+        dataset_cfg = config.get("dataset", {})
+
+        if camera_view is not None:
+            dataset_cfg["camera_view"] = int(camera_view)
+
+        if table_color is not None:
+            dataset_cfg["table_color"] = str(table_color)
+
+        if granular_radius is not None:
+            dataset_cfg.setdefault("obj_params", {})
+            dataset_cfg["obj_params"]["radius"] = float(granular_radius)
+
+        config["dataset"] = dataset_cfg
+
         super().__init__(config=config)
         self.action_dim = 4
         self.proprio_start_idx = 0
@@ -295,24 +317,15 @@ class FlexEnvWrapper(FlexEnv):
         # force_recenter 파라미터가 제공되면 사용, 없으면 플래그 확인
         if force_recenter is None:
             force_recenter = getattr(self, '_force_recenter_after_set_states', False)
-        # 디버깅: 플래그 확인
-        flag_before = getattr(self, '_force_recenter_after_set_states', None)
-        print(f"[DEBUG] prepare() - force_recenter param={force_recenter}, flag={flag_before}, final={force_recenter}")
-        # FlexEnvWrapper는 FlexEnv를 상속하므로, self 자체에 플래그가 설정되어 있어야 함
         if force_recenter:
-            print(f"[DEBUG] prepare() - force_recenter flag is True, will call reset(force_recenter=True)")
-            # reset()에 force_recenter 파라미터로 직접 전달
             imgs_list, particle_pos_list, eef_states_list = self.reset(save_data=True, force_recenter=True)
-            print(f"[DEBUG] prepare() - Called reset() with force_recenter=True")
         else:
-            print(f"[DEBUG] prepare() - force_recenter flag is False, calling reset() without force_recenter")
             imgs_list, particle_pos_list, eef_states_list = self.reset(save_data=True)
         # set_states()에도 force_recenter 전달 (reset()에서 플래그를 확인했지만, set_states()에서도 확인하도록)
         self.set_states(init_state, force_recenter=force_recenter)
         if force_recenter:
             # 플래그는 한 번만 사용하므로 리셋하지 않음 (다음 final output을 위해 유지)
-            # self._force_recenter_after_set_states = False
-            print("[DEBUG] prepare() - Force recentered in reset() and set_states() for final output")
+            pass
         # Measure Initial CD after set_states (first time only)
         # This will be called by evaluator to measure CD after first set_states
         if hasattr(self, '_measure_initial_cd') and self._measure_initial_cd:
@@ -377,15 +390,9 @@ class FlexEnvWrapper(FlexEnv):
         # 🔧 final output 계산 시 플래그 확인 및 prepare()에 전달
         if force_recenter is None:
             force_recenter = getattr(self, '_force_recenter_after_set_states', False)
-        # 디버깅: 플래그 확인
-        flag_value = getattr(self, '_force_recenter_after_set_states', None)
-        print(f"[DEBUG] FlexEnvWrapper.rollout() - Checking force_recenter: param={force_recenter}, flag={flag_value}, final={force_recenter}")
         if force_recenter:
-            print(f"[DEBUG] rollout() - force_recenter is True, will pass to prepare()")
             # 🔧 플래그를 명시적으로 설정 (확실히 전달되도록)
             self._force_recenter_after_set_states = True
-        else:
-            print(f"[DEBUG] rollout() - force_recenter is False, will NOT recenter")
         obs, state_dct = self.prepare(seed, init_state, force_recenter=force_recenter)
         obses, rewards, dones, infos = self.step_multiple(actions)
         for k in obses.keys():

@@ -108,11 +108,11 @@ def rope_scene(obj_params):
 
 
 def granular_scene(obj_params):
-    radius = 0.15
+    radius = float(obj_params.get("radius", 0.15))
     # print(1/0)
 
     # granular_scale = rand_float(0.1, 0.3)
-    granular_scale = obj_params["granular_scale"]
+    granular_scale = obj_params.get("granular_scale", radius)
 
     # area = rand_float(1**2, 3**2)
     # area = 1.5
@@ -128,7 +128,7 @@ def granular_scene(obj_params):
     z_min = -z_max
 
     # granular_dis = rand_float(0.1 * granular_scale, 0.2 * granular_scale)
-    granular_dis = obj_params["granular_dis"]
+    granular_dis = obj_params.get("granular_dis", 0.03)
 
     # Calculate grid dimensions, but allow override from obj_params for exact particle count
     if "num_granular_ft_x" in obj_params and "num_granular_ft_z" in obj_params:

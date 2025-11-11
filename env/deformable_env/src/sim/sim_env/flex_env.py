@@ -21,11 +21,23 @@ from ..utils import fps_with_idx, quatFromAxisAngle, find_min_distance, rand_flo
 
 BASE_DIR = os.path.abspath(os.path.join(__file__, "../../../../../../"))
 
+TABLE_COLOR_MAP = {
+    "default": np.ones(3, dtype=np.float32) * (160.0 / 255.0),
+    "brown": np.array([0.6, 0.4, 0.2], dtype=np.float32),
+    "purple": np.array([0.5, 0.0, 0.5], dtype=np.float32),
+}
+DEFAULT_TABLE_COLOR_NAME = "default"
+
 class FlexEnv(gym.Env):
     def __init__(self, config=None) -> None:
         super().__init__()
 
         self.dataset_config = config["dataset"]
+        raw_table_color = self.dataset_config.get("table_color", DEFAULT_TABLE_COLOR_NAME)
+        self.table_color = str(raw_table_color).lower()
+        if self.table_color not in TABLE_COLOR_MAP:
+            print(f"[WARN] Unknown table_color '{self.table_color}', falling back to '{DEFAULT_TABLE_COLOR_NAME}'.")
+            self.table_color = DEFAULT_TABLE_COLOR_NAME
         # Flag to track if set_states has been called for the first time
         self._first_set_states = True
 
@@ -66,6 +78,13 @@ class FlexEnv(gym.Env):
             pyflex.set_light_dir(np.array([0.1, 5.0, 0.1]))
         if hasattr(pyflex, "set_light_fov"):
             pyflex.set_light_fov(70.0)
+        # Ensure previous PyFlex context is cleaned before re-initializing (important when creating multiple envs sequentially)
+        if hasattr(pyflex, "is_initialized") and pyflex.is_initialized():
+            try:
+                pyflex.clean()
+            except Exception:
+                pass
+
         # Initialize PyFleX (new version requires 4 args: headless, render, width, height)
         headless = bool(self.dataset_config["headless"])
         # Ensure EGL is used in headless mode
@@ -403,13 +422,8 @@ class FlexEnv(gym.Env):
         center = np.array([0.0, 0.0, 0.0])
         quats = quatFromAxisAngle(axis=np.array([0.0, 1.0, 0.0]), angle=0.0)
         hideShape = 0
-        # color = np.ones(3) * (160.0 / 255.0) # 환경 변화 color = np.ones(3) * (160.0 / 255.0)
-        # color = np.array([0.0, 0.4, 0.0], dtype=np.float32) # dark green
-        # color = np.array([0.5, 0.0, 0.5], dtype=np.float32) # purple
-        # color = np.array([1.0, 1.0, 0.0], dtype=np.float32) # yellow
-        color = np.array([0.6, 0.4, 0.2], dtype=np.float32) # brown
-        # color = np.array([0.8, 0.0, 0.0], dtype=np.float32) # red
-        pyflex.add_box(halfEdge, center, quats, hideShape, color)
+        table_color = TABLE_COLOR_MAP.get(self.table_color, TABLE_COLOR_MAP[DEFAULT_TABLE_COLOR_NAME])
+        pyflex.add_box(halfEdge, center, quats, hideShape, table_color)
         self.table_shape_states[0] = np.concatenate([center, center, quats, quats])
         
         # DEBUG: Print workspace table xy (xz plane) corner coordinates
@@ -438,13 +452,7 @@ class FlexEnv(gym.Env):
         center = np.array([-self.wkspace_width - robot_table_width, 0.0, 0.0])
         quats = quatFromAxisAngle(axis=np.array([0.0, 1.0, 0.0]), angle=0.0)
         hideShape = 0
-        # color = np.ones(3) * (160.0 / 255.0) # 환경 변화 color = np.ones(3) * (160.0 / 255.0)
-        # color = np.array([0.0, 0.4, 0.0], dtype=np.float32) # dark green
-        # color = np.array([0.5, 0.0, 0.5], dtype=np.float32) # purple
-        # color = np.array([1.0, 1.0, 0.0], dtype=np.float32) # yellow
-        color = np.array([0.6, 0.4, 0.2], dtype=np.float32) # brown
-        # color = np.array([0.8, 0.0, 0.0], dtype=np.float32) # red
-        pyflex.add_box(halfEdge, center, quats, hideShape, color)
+        pyflex.add_box(halfEdge, center, quats, hideShape, table_color)
         self.table_shape_states[1] = np.concatenate([center, center, quats, quats])
         
         # DEBUG: Print robot table xy (xz plane) corner coordinates
@@ -661,15 +669,8 @@ class FlexEnv(gym.Env):
         # 파라미터로 전달된 force_recenter를 우선 사용, 없으면 플래그 확인
         if not force_recenter:
             force_recenter = getattr(self, '_force_recenter_after_set_states', False)
-        # 디버깅: 플래그 값과 타입 확인
-        flag_value = getattr(self, '_force_recenter_after_set_states', None)
-        print(f"[DEBUG] reset() - force_recenter param={force_recenter}, flag={flag_value}, final_decision={force_recenter}")
         if force_recenter:
-            print(f"[DEBUG] reset() - force_recenter is True, will recenter after stabilization")
             self._recenter_particles_xz()
-            print(f"[DEBUG] reset() - Recentering completed")
-        else:
-            print(f"[DEBUG] reset() - force_recenter is False, skipping recentering")
 
         # save initial rendering
         if save_data:
@@ -1176,7 +1177,6 @@ class FlexEnv(gym.Env):
             should_recenter = False
             if force_recenter:
                 should_recenter = True
-                print(f"[DEBUG] set_states() - force_recenter=True, calling _recenter_particles_xz()")
             elif self._first_set_states and FlexEnv._global_first_set_states_count < 5:
                 should_recenter = True
                 FlexEnv._global_first_set_states_count += 1

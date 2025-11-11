@@ -81,6 +81,15 @@ class FlexScene:
             
             # Set up signal handler for SIGSEGV (segmentation fault)
             old_handler = signal.signal(signal.SIGSEGV, crash_handler)
+            timeout_triggered = [False]
+
+            def timeout_handler(signum, frame):
+                timeout_triggered[0] = True
+                raise TimeoutError("pyflex.set_scene timed out")
+
+            old_alarm_handler = signal.signal(signal.SIGALRM, timeout_handler)
+        else:
+            old_alarm_handler = None
         
         try:
             # Critical: Call set_scene with explicit type casting
@@ -89,22 +98,30 @@ class FlexScene:
             
             # Double-check parameters before call
             if self.obj == "granular":
+                print("[DEBUG] Preparing to call pyflex.set_scene (granular)")
                 print(f"Calling pyflex.set_scene({env_idx_int}, array[{len(scene_params_f32)}], {flags_int})")
                 sys.stdout.flush()
             
-            # CRITICAL: pyflex.set_scene() appears to hang/block indefinitely
-            # This suggests the PyFlex C++ code for env_idx 35 has a blocking issue
-            print(f"Calling pyflex.set_scene({self.env_idx}, array[{len(scene_params_f32)}], 0)")
-            sys.stdout.flush()
-            
             # Try to call with a simple attempt first
             try:
+                if self.obj == "granular":
+                    print("[DEBUG] About to execute pyflex.set_scene(...)")
+                    sys.stdout.flush()
+                    signal.setitimer(signal.ITIMER_REAL, 5.0)
                 # This call may hang indefinitely - no Python-level solution exists
                 pyflex.set_scene(env_idx_int, scene_params_f32, flags_int)
+                if self.obj == "granular":
+                    signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    print("[DEBUG] Returned from pyflex.set_scene(...) without exception")
+                    sys.stdout.flush()
             except KeyboardInterrupt:
                 print("\n⚠️  pyflex.set_scene() was interrupted - likely hung")
                 print("   This confirms a blocking issue in PyFlex C++ code")
                 print("   Solution: PyFlex needs to be fixed or rebuilt for your GPU")
+                raise
+            except TimeoutError:
+                if self.obj == "granular":
+                    print("\n⚠️  pyflex.set_scene() timed out after 60 seconds - aborting scene setup")
                 raise
             
             # If we get here, set_scene succeeded
@@ -121,12 +138,17 @@ class FlexScene:
                 print("3. Modify PyFlex source code to fix env_idx 35 compatibility")
                 # Restore signal handler
                 signal.signal(signal.SIGSEGV, old_handler)
+                if old_alarm_handler is not None:
+                    signal.signal(signal.SIGALRM, old_alarm_handler)
             raise
         finally:
             if self.obj == "granular":
                 # Restore original signal handler
                 try:
                     signal.signal(signal.SIGSEGV, old_handler)
+                    if old_alarm_handler is not None:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                        signal.signal(signal.SIGALRM, old_alarm_handler)
                 except:
                     pass
 

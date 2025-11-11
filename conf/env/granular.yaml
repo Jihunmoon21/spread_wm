@@ -6,6 +6,7 @@ dataset:
     # area: 1.5
     xz_ratio: 1.0
     granular_dis: 0.03 # 0.15
+    radius: 0.15
 
   # data collection
   base: 0
