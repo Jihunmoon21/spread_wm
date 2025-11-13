@@ -80,6 +80,8 @@ class OnlineLora:
             
         # 마지막 Loss 값 저장용 (태스크 전환을 위해)
         self.last_loss = None
+        self.last_visual_loss = None
+        self.last_proprio_loss = None
         
         # LoRA 적층 콜백 함수 (태스크 추적을 위해)
         self.on_lora_stack_callback = None
@@ -158,7 +160,27 @@ class OnlineLora:
             
             print(f"LoRA step timing - Rollout: {rollout_time:.4f}s, Encode: {encode_time:.4f}s, Loss: {loss_time:.4f}s, Backward: {backward_time:.4f}s")
 
-            return total_loss.item()
+            loss_value = total_loss.item()
+            self.last_visual_loss = visual_loss.item()
+            self.last_proprio_loss = proprio_loss.item()
+
+            planner_iter = None
+            if getattr(self.workspace, "planner", None) is not None:
+                planner_iter = getattr(self.workspace.planner, "iter", None)
+
+            if (
+                getattr(self.workspace, "is_training_mode", True)
+                and planner_iter == 1
+                and getattr(self.workspace, "forward_transfer_metrics", None) is None
+            ):
+                self.workspace.forward_transfer_metrics = {
+                    "total_loss": loss_value,
+                    "visual_loss": self.last_visual_loss,
+                    "proprio_loss": self.last_proprio_loss,
+                    "iteration": planner_iter,
+                }
+
+            return loss_value
 
         except Exception as e:
             print(f"Error during training step: {e}")
@@ -289,6 +311,45 @@ class OnlineLora:
                 })
         
         return success
+    
+    def compute_loss_only(self, trans_obs_0, actions, e_obses):
+        """
+        온라인 학습을 수행하지 않고 현재 모델의 손실을 계산합니다.
+        """
+        try:
+            with torch.no_grad():
+                i_z_obses_pred, _ = self.wm.rollout(obs_0=trans_obs_0, act=actions)
+                trans_obs_gt = self.workspace.data_preprocessor.transform_obs(e_obses)
+                trans_obs_gt = move_to_device(trans_obs_gt, self.device)
+                i_z_obses_gt = self.wm.encode_obs(trans_obs_gt)
+
+                frameskip = self.workspace.frameskip
+                gt_proprio_resampled = i_z_obses_gt["proprio"][:, ::frameskip, :]
+                gt_visual_resampled = i_z_obses_gt["visual"][:, ::frameskip, :, :]
+
+                proprio_loss = self.loss_fn(i_z_obses_pred["proprio"], gt_proprio_resampled)
+                visual_loss = self.loss_fn(i_z_obses_pred["visual"], gt_visual_resampled)
+                total_loss = self.visual_loss_weight * visual_loss + self.proprio_loss_weight * proprio_loss
+
+                metrics = {
+                    "visual_loss": float(visual_loss.item()),
+                    "proprio_loss": float(proprio_loss.item()),
+                    "total_loss": float(total_loss.item()),
+                }
+
+                self.last_visual_loss = metrics["visual_loss"]
+                self.last_proprio_loss = metrics["proprio_loss"]
+                self.last_loss = metrics["total_loss"]
+
+                return metrics
+        except Exception as e:
+            print(f"Error computing evaluation loss: {e}")
+            return None
+        finally:
+            if 'i_z_obses_pred' in locals():
+                del i_z_obses_pred
+            if 'i_z_obses_gt' in locals():
+                del i_z_obses_gt
     
     def _perform_lora_stacking(self, stack_type, task_id, reason):
         """

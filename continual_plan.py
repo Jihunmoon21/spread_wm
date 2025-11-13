@@ -826,11 +826,11 @@ def planning_main(cfg_dict):
                 task_lora_stacks += 1
                 print(f"✅ Task-based LoRA stacking successful. Total stacks in task: {task_lora_stacks}")
             else:
-                print(f"⚠️  Task-based LoRA stacking skipped or failed.")
+                print(f"Task-based LoRA stacking skipped or failed.")
         else:
             # 🔧 앙상블 LoRA 사용 여부에 따른 메시지 출력
             if hasattr(plan_workspace.online_learner, 'ensemble_manager'):
-                print(f"⚠️  Task-based LoRA stacking disabled (hybrid_enabled: {getattr(plan_workspace.online_learner, 'hybrid_enabled', False)}, task_based_stacking: {getattr(plan_workspace.online_learner, 'task_based_stacking', False)})")
+                print(f"Task-based LoRA stacking disabled (hybrid_enabled: {getattr(plan_workspace.online_learner, 'hybrid_enabled', False)}, task_based_stacking: {getattr(plan_workspace.online_learner, 'task_based_stacking', False)})")
             else:
                 print(f"⚠️  Standard OnlineLora mode - using default LoRA stacking behavior")
 

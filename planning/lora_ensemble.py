@@ -7,7 +7,7 @@ import gzip
 import pickle
 import io
 import numpy as np
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 from collections import OrderedDict, deque
 from contextlib import redirect_stdout
 from utils import move_to_device
@@ -63,6 +63,10 @@ class LoRAEnsembleManager:
             bool: 추가 성공 여부
         """
         try:
+            if task_id in self.ensemble_members:
+                print(f"ℹ️  Ensemble member for Task {task_id} already exists. Skipping update to preserve original weights.")
+                return False
+
             # 앙상블 크기 제한 확인
             if len(self.ensemble_members) >= self.max_ensemble_size:
                 self._remove_oldest_member()
@@ -305,11 +309,17 @@ class LoRAEnsembleManager:
             print(f"💾 Moved to disk: Task {task_id}")
     
     def _save_member_to_disk(self, task_id: int, member_info: Dict):
-        """멤버를 디스크에 저장"""
+        """멤버를 디스크에 저장 (이미 존재하면 건너뜀)"""
         save_path = os.path.join(self.cache_dir, f"lora_task_{task_id}.pth")
+        
+        # 파일이 이미 존재하면 덮어쓰지 않음
+        if os.path.exists(save_path):
+            print(f"ℹ️  LoRA file for Task {task_id} already exists at {save_path}. Skipping save to preserve original weights.")
+            return
         
         # LoRA 가중치만 저장 (메타데이터는 별도 관리)
         torch.save(member_info['lora_weights'], save_path)
+        print(f"💾 Saved LoRA member for Task {task_id} to {save_path}")
     
 
 
@@ -349,6 +359,8 @@ class EnsembleOnlineLora:
         self.task_changed = self.base_online_lora.task_changed  # 태스크 전환 감지 플래그
         self.stack_history = self.base_online_lora.stack_history
         self.last_loss = self.base_online_lora.last_loss  # 초기값 복사 (update()에서 동기화)
+        self.last_visual_loss = getattr(self.base_online_lora, "last_visual_loss", None)
+        self.last_proprio_loss = getattr(self.base_online_lora, "last_proprio_loss", None)
         self.optimizer = self.base_online_lora.optimizer
         self.loss_fn = self.base_online_lora.loss_fn
         self.visual_loss_weight = self.base_online_lora.visual_loss_weight
@@ -368,6 +380,10 @@ class EnsembleOnlineLora:
             cache_dir=self.cfg.get("cache_dir", "./lora_cache"),
             max_memory_mb=self.cfg.get("max_memory_mb", 200)
         )
+
+        # 최근 앙상블 평가 결과 저장
+        self.last_ensemble_evaluation_summary: Optional[Dict[str, Any]] = None
+        self.created_task_ids = set()
         
         print(f"EnsembleOnlineLora initialized:")
         print(f"  - Base OnlineLora: {self.is_online_lora}")
@@ -402,6 +418,10 @@ class EnsembleOnlineLora:
         
         # 🔧 모든 상태 동기화 (base_online_lora에서 설정된 값 사용)
         self.last_loss = self.base_online_lora.last_loss
+        self.last_visual_loss = getattr(self.base_online_lora, "last_visual_loss", None)
+        self.last_proprio_loss = getattr(self.base_online_lora, "last_proprio_loss", None)
+        self.last_visual_loss = getattr(self.base_online_lora, "last_visual_loss", None)
+        self.last_proprio_loss = getattr(self.base_online_lora, "last_proprio_loss", None)
         self.task_changed = self.base_online_lora.task_changed
         self.stacks_in_current_task = self.base_online_lora.stacks_in_current_task
         self.current_task_id = self.base_online_lora.current_task_id
@@ -409,6 +429,17 @@ class EnsembleOnlineLora:
         # 앙상블 기반 적층 로직 (향후 구현)
         if self.last_loss is not None and self.hybrid_enabled:
             self._manage_ensemble_stacking(self.last_loss)
+    
+    def compute_loss_only(self, trans_obs_0, actions, e_obses):
+        """
+        온라인 학습 없이 현재 모델의 손실을 평가합니다.
+        """
+        metrics = self.base_online_lora.compute_loss_only(trans_obs_0, actions, e_obses)
+        if metrics:
+            self.last_loss = self.base_online_lora.last_loss
+            self.last_visual_loss = getattr(self.base_online_lora, "last_visual_loss", None)
+            self.last_proprio_loss = getattr(self.base_online_lora, "last_proprio_loss", None)
+        return metrics
     
     def trigger_task_based_stacking(self, task_id, reason="task_change"):
         """
@@ -813,6 +844,9 @@ class EnsembleOnlineLora:
         if not self.save_on_task_end:
             print("ℹ️ save_on_task_end is disabled; skipping final save")
             return False
+        if task_id in self.created_task_ids:
+            print(f"ℹ️ LoRA member for Task {task_id} already saved in this session. Skipping save.")
+            return False
         
         # 🔧 stacks_in_current_task 동기화 문제 해결
         # base_online_lora의 실제 값을 직접 참조
@@ -852,7 +886,7 @@ class EnsembleOnlineLora:
         try:
             fingerprint_parts = self._fingerprint_weights(current_weights, sample_layers=4)
             fingerprint = "|".join(fingerprint_parts) if fingerprint_parts else "EMPTY"
-            print(f"🧬 Save-time fingerprint for Task {task_id}: {fingerprint}")
+            print(f"🧬 Save-time fingerprint for Task {task_id}")
         except Exception as e:
             print(f"⚠️ Could not compute save-time fingerprint: {e}")
             fingerprint = None
@@ -875,6 +909,7 @@ class EnsembleOnlineLora:
         )
         if saved:
             print(f"💾 Saved finalized LoRA member for Task {task_id} (reason={reason})")
+            self.created_task_ids.add(task_id)
         return saved
     
     
@@ -903,6 +938,8 @@ class EnsembleOnlineLora:
         self.current_task_id = self.base_online_lora.current_task_id
         self.stacks_in_current_task = self.base_online_lora.stacks_in_current_task
         self.last_loss = self.base_online_lora.last_loss
+        self.last_visual_loss = getattr(self.base_online_lora, "last_visual_loss", None)
+        self.last_proprio_loss = getattr(self.base_online_lora, "last_proprio_loss", None)
         
         # 🔧 태스크가 변경되면 using_member_without_stacking 플래그 리셋
         if task_changed:
@@ -1080,6 +1117,23 @@ class EnsembleOnlineLora:
                 print(f"⚠️  Predictor doesn't have w_As/w_Bs. Cannot apply LoRA weights.")
                 return False
             
+            # 🔧 w와 wnew 초기화: 앙상블 멤버 로드 전에 이전 값 제거
+            with torch.no_grad():
+                # w_As와 w_Bs 초기화
+                for w_A in predictor.w_As:
+                    nn.init.zeros_(w_A.weight)
+                for w_B in predictor.w_Bs:
+                    nn.init.zeros_(w_B.weight)
+                
+                # wnew_As와 wnew_Bs 초기화
+                if hasattr(predictor, 'wnew_As') and hasattr(predictor, 'wnew_Bs'):
+                    for wnew_A in predictor.wnew_As:
+                        nn.init.zeros_(wnew_A.weight)
+                    for wnew_B in predictor.wnew_Bs:
+                        nn.init.zeros_(wnew_B.weight)
+            
+            print(f"🔧 Reset all LoRA weights (w, wnew) to zeros before loading ensemble member")
+            
             # 첫 번째 스택 (모든 적층 효과가 포함된 레이어들)에 앙상블 멤버의 가중치 적용
             w_As = predictor.w_As
             w_Bs = predictor.w_Bs
@@ -1138,13 +1192,11 @@ class EnsembleOnlineLora:
     def perform_task_change_ensemble_selection(self, workspace):
         """
         태스크 전환 시 새로운 태스크에 대한 실제 성능 평가를 통한 최적 멤버 선택 및 적층
-        
-        새로운 태스크에 대한 각 멤버의 실제 성능을 평가하여:
-        1. 새로운 태스크에 대한 각 멤버의 실제 성능 평가
-        2. 실제 성능 기반 최적 멤버 선택
-        3. loss 임계값 확인 후 LoRA 적층 여부 결정
         """
         print(f"🎯 Performing task change ensemble selection with task-specific evaluation...")
+
+        # 최근 평가 요약 초기화
+        self.last_ensemble_evaluation_summary = None
         
         ensemble_cfg = workspace.cfg_dict.get("lora", {}).get("ensemble_cfg", {})
         inference_cfg = ensemble_cfg.get("inference", {})
@@ -1158,12 +1210,19 @@ class EnsembleOnlineLora:
         
         if not task_change_evaluation:
             print(f"⚠️  Task change evaluation disabled, skipping ensemble selection")
+            self.last_ensemble_evaluation_summary = {
+                "status": "skipped",
+                "reason": "task_change_evaluation_disabled",
+            }
             return
         
         if not task_specific_evaluation:
             print(f"⚠️  Task-specific evaluation disabled, using stored performance")
-            # 기존 방식으로 폴백 (저장된 성능 사용)
             self.perform_legacy_ensemble_selection(workspace)
+            self.last_ensemble_evaluation_summary = {
+                "status": "legacy_selection",
+                "reason": "task_specific_evaluation_disabled",
+            }
             return
         
         try:
@@ -1173,12 +1232,20 @@ class EnsembleOnlineLora:
             if len(self.ensemble_manager.ensemble_members) == 0:
                 print("ℹ️  No ensemble members available for evaluation (first task or no previous members).")
                 print("ℹ️  Proceeding with normal planning without ensemble selection.")
+                self.last_ensemble_evaluation_summary = {
+                    "status": "skipped",
+                    "reason": "no_ensemble_members",
+                }
                 return
             
             member_performances = self.evaluate_members_for_new_task(workspace)
             
             if not member_performances:
                 print(f"⚠️  No valid member performances found")
+                self.last_ensemble_evaluation_summary = {
+                    "status": "skipped",
+                    "reason": "no_valid_member_performance",
+                }
                 return
             
             # 2. 실제 성능 기반 최적 멤버 선택
@@ -1188,6 +1255,10 @@ class EnsembleOnlineLora:
             for task_id, performance in member_performances:
                 print(f"   - Task {task_id}: Loss {performance['loss']:.6f}")
             print(f"🏆 Best member for new task: Task {best_member_task_id} (Loss: {best_performance['loss']:.6f})")
+            
+            stacking_triggered = False
+            stacking_applied = False
+            stacking_reason = "loss_within_threshold"
             
             # 3. loss 임계값 확인 후 LoRA 적층 여부 결정
             if best_performance['loss'] <= evaluation_loss_threshold:
@@ -1199,17 +1270,60 @@ class EnsembleOnlineLora:
             else:
                 print(f"⚠️  Best member loss ({best_performance['loss']:.6f}) > threshold ({evaluation_loss_threshold})")
                 print(f"🔧 LoRA stacking needed - stacking on best member")
+                stacking_triggered = True
+                stacking_reason = "loss_above_threshold"
                 
                 if stack_on_selected:
                     # 선택된 멤버 위에 새로운 LoRA 적층
                     self.stack_on_selected_member(best_member_task_id, workspace)
+                    stacking_applied = True
                 else:
                     print(f"ℹ️  Stacking on selected member disabled")
+                    stacking_reason = "stacking_disabled"
+            
+            # 🔒 평가 결과 저장 (부모 프로세스로 전달할 수 있도록)
+            members_summary: List[Dict[str, Any]] = []
+            for task_id, performance in member_performances:
+                entry: Dict[str, Any] = {"task_id": int(task_id)}
+                if isinstance(performance, dict):
+                    for key, value in performance.items():
+                        if isinstance(value, (int, float, bool)) or value is None:
+                            entry[key] = value
+                        else:
+                            try:
+                                entry[key] = float(value)
+                            except Exception:
+                                entry[key] = str(value)
+                members_summary.append(entry)
+            
+            best_member_summary = {
+                "task_id": int(best_member_task_id),
+                "performance": {
+                    key: (value if isinstance(value, (int, float, bool)) or value is None else str(value))
+                    for key, value in (best_performance or {}).items()
+                },
+            }
+            
+            self.last_ensemble_evaluation_summary = {
+                "status": "evaluated",
+                "members": members_summary,
+                "best_member": best_member_summary,
+                "threshold": evaluation_loss_threshold,
+                "stacking_triggered": stacking_triggered,
+                "stacking_applied": stacking_applied,
+                "stacking_reason": stacking_reason,
+                "stack_on_selected": stack_on_selected,
+                "select_best_member": select_best_member,
+            }
                 
         except Exception as e:
             print(f"❌ Task change ensemble selection failed: {e}")
             import traceback
             traceback.print_exc()
+            self.last_ensemble_evaluation_summary = {
+                "status": "error",
+                "reason": str(e),
+            }
     
     def evaluate_members_for_new_task(self, workspace):
         """
@@ -1292,8 +1406,6 @@ class EnsembleOnlineLora:
                     
                     if saved_fp:
                         match_status = "✅ MATCH" if applied_fp == saved_fp else "❌ MISMATCH"
-                        print(f"🧬 Load-time fingerprint (sampled): {applied_fp}")
-                        print(f"🧬 Saved-time fingerprint (sampled): {saved_fp}")
                         print(f"🔍 Fingerprint comparison: {match_status}")
                         if applied_fp != saved_fp:
                             print(f"⚠️  WARNING: Task {task_id} fingerprint mismatch detected!")
@@ -1332,62 +1444,74 @@ class EnsembleOnlineLora:
     def evaluate_member_for_current_task(self, workspace, actions=None, evaluation_steps=5):
         """
         evaluator.py의 eval_actions를 직접 사용하여 앙상블 멤버 평가
+        (망각 측정과 동일하게 단일 평가만 수행, MPC planning 없음)
         
         Args:
             workspace: PlanWorkspace 인스턴스
-            actions: 계획된 행동 시퀀스 (evaluator.py와 동일)
-            evaluation_steps: 평가 시 사용할 스텝 수 (actions가 None일 때만 사용)
+            actions: 사용되지 않음 (망각 측정과 동일하게 zero actions 사용)
+            evaluation_steps: 사용되지 않음
             
         Returns:
             Dict: 성능 지표
         """
         try:
-            if actions is None:
-                # 1. 계획된 행동 생성: 플래너 사용 (없으면 랜덤으로 폴백)
-                try:
-                    planned_actions, action_len = workspace.planner.plan(
-                        obs_0=workspace.obs_0,
-                        obs_g=workspace.obs_g,
-                        actions=None,
-                    )
-                    actions = planned_actions
-                    if evaluation_steps is not None and planned_actions.shape[1] > evaluation_steps:
-                        actions = planned_actions[:, :evaluation_steps, :]
-                except Exception as e:
-                    print(f"⚠️  Fallback to random actions for ensemble evaluation: {e}")
-                    n_evals = 1
-                    actions = torch.randn(n_evals, evaluation_steps, workspace.action_dim, device=self.device)
-            
-            # 2. 터미널 출력 캡처를 위한 StringIO 사용
-            captured_output = io.StringIO()
-            with redirect_stdout(captured_output):
-                # evaluator.py의 eval_actions 직접 사용
-                logs, successes, e_obses, e_states = workspace.evaluator.eval_actions(
-                    actions=actions,
-                    action_len=None,  # evaluator.py가 자동으로 np.inf 설정
-                    filename="ensemble_eval",
-                    save_video=False,
+            # 망각 측정과 동일한 방식: MPC planning 없이 단순 평가만 수행
+            # evaluate_loss_only()와 동일한 로직 사용
+            if workspace.gt_actions is not None:
+                actions_eval = (
+                    workspace.gt_actions.to(device=workspace.device, dtype=torch.float32).detach()
                 )
-            
-            # 3. 캡처된 출력에서 loss 값 파싱
-            output_text = captured_output.getvalue()
-            parsed_loss = self._parse_loss_from_output(output_text)
-            
-            if parsed_loss is not None:
-                print(f"   📊 Parsed Online Learning loss: {parsed_loss:.6f}")
-                
-                return {
-                    'loss': parsed_loss,
-                    'visual_loss': parsed_loss * 0.8,  # 근사값
-                    'proprio_loss': parsed_loss * 0.2,  # 근사값
-                    'success_rate': logs.get('success_rate', 0)
-                }
+                action_len = np.full(actions_eval.shape[0], actions_eval.shape[1])
             else:
-                print("   ❌ Failed to parse loss from output!")
-                return None
+                batch_size = workspace.obs_0["visual"].shape[0]
+                horizon = 1 if workspace.goal_H <= 0 else workspace.goal_H
+                actions_eval = torch.zeros(
+                    (batch_size, horizon, workspace.action_dim),
+                    device=workspace.device,
+                    dtype=torch.float32,
+                )
+                action_len = np.full(batch_size, horizon)
+
+            workspace.evaluator.force_recenter_for_next_rollout()
+            logs, successes, e_obses, _ = workspace.evaluator.eval_actions(
+                actions_eval,
+                action_len,
+                save_video=False,
+                filename="ensemble_eval",
+                learning_enabled=False,
+            )
+            
+            # logs에서 직접 loss 값 추출 (evaluator.py에서 이미 계산되어 있음)
+            visual_loss = logs.get('visual_loss', None)
+            proprio_loss = logs.get('proprio_loss', None)
+            total_loss = logs.get('total_loss', None)
+            
+            # total_loss가 없으면 visual_loss와 proprio_loss 합산 시도
+            if total_loss is None:
+                if visual_loss is not None and proprio_loss is not None:
+                    total_loss = visual_loss + proprio_loss
+                elif visual_loss is not None:
+                    total_loss = visual_loss
+                else:
+                    print("   ❌ Failed to extract loss from logs!")
+                    return None
+            
+            visual_str = f"{visual_loss:.6f}" if visual_loss is not None else "N/A"
+            proprio_str = f"{proprio_loss:.6f}" if proprio_loss is not None else "N/A"
+            print(f"   📊 Ensemble evaluation loss: total={total_loss:.6f}, visual={visual_str}, proprio={proprio_str}")
+            
+            return {
+                'loss': total_loss,
+                'visual_loss': visual_loss if visual_loss is not None else (total_loss * 0.8),
+                'proprio_loss': proprio_loss if proprio_loss is not None else (total_loss * 0.2),
+                'success_rate': logs.get('success_rate', 0),
+                'chamfer_distance': logs.get('chamfer_distance', None)
+            }
             
         except Exception as e:
             print(f"❌ Error evaluating member: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def _parse_loss_from_output(self, output_text):
@@ -1500,6 +1624,40 @@ class EnsembleOnlineLora:
                 
         except Exception as e:
             print(f"❌ Legacy ensemble selection failed: {e}")
+    
+    def apply_latest_member_without_evaluation(self, workspace):
+        """
+        대조군 모드: 앙상블 평가 없이 가장 최근 멤버만 로드하여 사용
+        
+        Args:
+            workspace: PlanWorkspace 인스턴스
+        """
+        try:
+            print(f"🔬 Control Group Mode: Applying latest member without ensemble evaluation...")
+            
+            if not hasattr(self, 'ensemble_manager') or self.ensemble_manager is None:
+                print("⚠️  No ensemble manager available")
+                return
+            
+            if len(self.ensemble_manager.ensemble_members) == 0:
+                print("ℹ️  No ensemble members available (first task). Proceeding with normal learning.")
+                return
+            
+            # 가장 최근 멤버 찾기
+            latest_task_id = max(self.ensemble_manager.ensemble_members.keys())
+            latest_member = self.ensemble_manager.ensemble_members[latest_task_id]
+            
+            print(f"📌 Latest member: Task {latest_task_id}")
+            
+            # 최근 멤버 위에 새로운 LoRA 적층
+            self.stack_on_selected_member(latest_task_id, workspace)
+            
+            print(f"✅ Control Group: Applied latest member (Task {latest_task_id}) and stacked new LoRA")
+            
+        except Exception as e:
+            print(f"❌ Control Group: Failed to apply latest member: {e}")
+            import traceback
+            traceback.print_exc()
     
     def stack_on_selected_member(self, selected_task_id, workspace):
         """

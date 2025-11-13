@@ -49,9 +49,11 @@ lora:
   enabled: true
   online: true
   ensemble: true                  # ← 기존 ensemble_lora.enabled 대체
+  no_ensemble_control: false     # 대조군 모드: true 시 앙상블 평가 없이 최근 멤버만 사용
   lr: 0.005                    # LoRA learning rate (기본값: 1e-4)
   visual_loss_weight: 1.0
   proprio_loss_weight: 0.5
+  ensemble_forgetting: false
   
   # 태스크 전환: loss 기반 전환 설정
   task_switch:

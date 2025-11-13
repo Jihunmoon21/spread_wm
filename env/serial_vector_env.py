@@ -94,10 +94,9 @@ class SerialVectorEnv:
             else:
                 force_recenter_env = force_recenter
             if force_recenter_env:
-                print(f"[DEBUG] SerialVectorEnv.rollout() - env[{i}] has force_recenter=True, will pass to rollout()")
+        
                 # 🔧 플래그를 명시적으로 다시 설정 (확실히 전달되도록)
                 env._force_recenter_after_set_states = True
-                print(f"[DEBUG] SerialVectorEnv.rollout() - Explicitly set _force_recenter_after_set_states=True before calling env.rollout()")
             obs, state = env.rollout(cur_seed, cur_init_state, cur_actions, force_recenter=force_recenter_env)
             obses.append(obs)
             states.append(state)

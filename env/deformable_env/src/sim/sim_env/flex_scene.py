@@ -97,23 +97,14 @@ class FlexScene:
             flags_int = int(0)
             
             # Double-check parameters before call
-            if self.obj == "granular":
-                print("[DEBUG] Preparing to call pyflex.set_scene (granular)")
-                print(f"Calling pyflex.set_scene({env_idx_int}, array[{len(scene_params_f32)}], {flags_int})")
-                sys.stdout.flush()
-            
             # Try to call with a simple attempt first
             try:
                 if self.obj == "granular":
-                    print("[DEBUG] About to execute pyflex.set_scene(...)")
-                    sys.stdout.flush()
                     signal.setitimer(signal.ITIMER_REAL, 5.0)
                 # This call may hang indefinitely - no Python-level solution exists
                 pyflex.set_scene(env_idx_int, scene_params_f32, flags_int)
                 if self.obj == "granular":
                     signal.setitimer(signal.ITIMER_REAL, 0.0)
-                    print("[DEBUG] Returned from pyflex.set_scene(...) without exception")
-                    sys.stdout.flush()
             except KeyboardInterrupt:
                 print("\n⚠️  pyflex.set_scene() was interrupted - likely hung")
                 print("   This confirms a blocking issue in PyFlex C++ code")
@@ -124,11 +115,6 @@ class FlexScene:
                     print("\n⚠️  pyflex.set_scene() timed out after 60 seconds - aborting scene setup")
                 raise
             
-            # If we get here, set_scene succeeded
-            if self.obj == "granular":
-                print("✓ pyflex.set_scene() completed successfully")
-                sys.stdout.flush()
-                
         except (RuntimeError, Exception) as e:
             if self.obj == "granular":
                 print(f"\nFailed to set granular scene: {e}")

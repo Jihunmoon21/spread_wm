@@ -96,6 +96,20 @@ class FlexEnvWrapper(FlexEnv):
     def update_env(self, env_info): 
         pass
 
+    def force_recenter_next_rollout(self):
+        """Force recentering for the next rollout."""
+        self._force_recenter_after_set_states = True
+        if hasattr(self, "_recentering_calls"):
+            self._recentering_calls = 0
+        if hasattr(self.__class__, "_global_recentering_calls"):
+            self.__class__._global_recentering_calls = 0
+        if hasattr(self, "env"):
+            inner_env = self.env
+            if hasattr(inner_env, "reset_recentering_counters"):
+                inner_env.reset_recentering_counters()
+            if hasattr(inner_env, "_force_recenter_after_set_states"):
+                inner_env._force_recenter_after_set_states = True
+
     def sample_random_init_goal_states(self, seed):
         """
         Return a random state
@@ -266,7 +280,6 @@ class FlexEnvWrapper(FlexEnv):
                     n_missing = N - target_xz.shape[0]
                     target_xz = torch.cat([target_xz, target_xz[-n_missing:]], dim=0)
                 
-                print(f"[DEBUG] Goal mode 3 (Cross): cx={cx:.3f}, cz={cz:.3f}, span={span:.3f}, cross_length={cross_length:.3f}, n_vertical={n_vertical}, n_horizontal={n_horizontal}")
             else:
                 # Fallback to random-like transformation
                 goal_scale, goal_theta, goal_delta = (

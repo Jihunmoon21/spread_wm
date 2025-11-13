@@ -58,6 +58,8 @@ class MPCPlanner(BasePlanner):
         self.iter = 0
         self.planned_actions = []
         self.ensemble_manager = ensemble_manager  # 🔧 앙상블 매니저 저장
+        self.iteration_metrics = []
+        self.evaluated_iterations_count = 0  # 실제로 평가가 수행된 iteration 횟수
 
     def _apply_success_mask(self, actions):
         device = actions.device
@@ -88,6 +90,10 @@ class MPCPlanner(BasePlanner):
         # 실제 환경 기준 CD 추적 (CD 증가 행동 거르기)
         prev_cd = None  # 이전 iteration의 CD 저장
         # 🔧 임시: 성공 여부와 관계없이 max_iter까지 수행
+        self.iter = 0  # plan() 호출 시마다 iter 초기화
+        self.iteration_metrics = []
+        self.evaluated_iterations_count = 0  # 실제로 평가가 수행된 iteration 횟수 초기화
+        print(f"[MPC] plan() called: max_iter={self.max_iter}, initial iter={self.iter}")
         while self.iter < self.max_iter:
             self.sub_planner.logging_prefix = f"plan_{self.iter}"
             
@@ -117,12 +123,61 @@ class MPCPlanner(BasePlanner):
                 print(f"[MPC FIX] Using updated conditions from previous iter for iter {self.iter}")
             
             # 새로 추가된 action만 평가 (현재 환경 상태에서 시작)
+            if self.iter < 3:
+                self.evaluator.force_recenter_for_next_rollout()
             logs, successes, e_obses, e_states = self.evaluator.eval_actions(
                 taken_actions,  # 전체 action_so_far가 아닌 새로 추가된 action만
                 self.action_len,
                 filename=f"{self.logging_prefix}_plan{self.iter}",
                 save_video=True,
             )
+            
+            # 🔧 CD 체크 전에 final loss 저장 (iter == max_iter - 1일 때, CD reverted 여부와 관계없이)
+            if (
+                getattr(self.evaluator, "workspace", None) is not None
+                and getattr(self.evaluator.workspace, "final_mpc_visual_loss", None) is None
+                and isinstance(self.max_iter, (int, float))
+                and self.iter == self.max_iter - 1
+            ):
+                value = None
+                visual_key = None
+                
+                # 원본 logs에서 visual_loss 찾기 (변환 전)
+                print(f"[MPC] Searching for visual_loss in logs keys: {list(logs.keys())[:10]}...")  # 디버깅
+                for key in logs.keys():
+                    lower_key = key.lower()
+                    if "visual" in lower_key and "loss" in lower_key:
+                        visual_key = key
+                        value = logs[visual_key]
+                        print(f"[MPC] Found visual_loss: key={visual_key}, value={value}")
+                        break
+                
+                if value is None:
+                    print(f"[MPC] ⚠️  visual_loss not found in logs. Available keys: {list(logs.keys())}")
+                
+                # 값 정규화
+                if value is not None:
+                    if isinstance(value, (list, tuple, np.ndarray)):
+                        if len(value) > 0:
+                            value = float(np.mean(value))
+                        else:
+                            value = None
+                    elif isinstance(value, (torch.Tensor,)):
+                        value = float(value.item())
+                    elif isinstance(value, (np.floating, float, int, np.integer)):
+                        value = float(value)
+                    else:
+                        value = None
+                
+                # 저장
+                if value is not None:
+                    self.evaluator.workspace.final_mpc_visual_loss = {
+                        "key": visual_key,
+                        "value": value,
+                        "iteration": self.iter,
+                    }
+                    print(f"[MPC] Saved final visual_loss for iter {self.iter}: {value:.6f} (from {visual_key})")
+            
             # ---- CD 증가 행동 차단 로직 ----
             # evaluator 로그에서 mean_chamfer_distance 추출
             cur_cd = logs.get("mean_chamfer_distance", None)
@@ -147,6 +202,56 @@ class MPCPlanner(BasePlanner):
                             self.planned_actions.pop()
                         # memo_actions도 이전 상태로 되돌리기 (다음 계획을 위해)
                         memo_actions = None
+                        
+                        # 🔧 CD 체크 전에 logs에서 visual_loss와 chamfer_distance 추출
+                        visual_loss_value = None
+                        chamfer_distance_value = None
+                        
+                        for key, value in logs.items():
+                            key_lower = key.lower()
+                            # visual_loss 추출
+                            if visual_loss_value is None and "visual" in key_lower and "loss" in key_lower and "dist" not in key_lower:
+                                if isinstance(value, (list, tuple, np.ndarray)):
+                                    if len(value) > 0:
+                                        visual_loss_value = float(np.mean(value))
+                                elif isinstance(value, (torch.Tensor,)):
+                                    visual_loss_value = float(value.item())
+                                elif isinstance(value, (np.floating, float, int, np.integer)):
+                                    visual_loss_value = float(value)
+                            
+                            # chamfer_distance 추출 (cur_cd와 동일한 값이지만 logs에서 직접 가져옴)
+                            if chamfer_distance_value is None and "chamfer" in key_lower:
+                                if isinstance(value, (list, tuple, np.ndarray)):
+                                    if len(value) > 0:
+                                        chamfer_distance_value = float(np.mean(value))
+                                elif isinstance(value, (torch.Tensor,)):
+                                    chamfer_distance_value = float(value.item())
+                                elif isinstance(value, (np.floating, float, int, np.integer)):
+                                    chamfer_distance_value = float(value)
+                        
+                        # CD 증가된 iteration도 metrics에 기록 (visual_loss와 chamfer_distance 포함)
+                        reverted_logs = {
+                            f"{self.logging_prefix}/reverted": True,
+                            f"{self.logging_prefix}/prev_cd": float(prev_cd[0]),
+                        }
+                        # 🔧 chamfer_distance 추가
+                        if chamfer_distance_value is not None:
+                            reverted_logs[f"{self.logging_prefix}/chamfer_distance"] = chamfer_distance_value
+                        else:
+                            # fallback: cur_cd 사용
+                            reverted_logs[f"{self.logging_prefix}/chamfer_distance"] = float(cur_cd[0])
+                        
+                        # 🔧 visual_loss 추가
+                        if visual_loss_value is not None:
+                            reverted_logs[f"{self.logging_prefix}/visual_loss"] = visual_loss_value
+                        
+                        self.iteration_metrics.append({
+                            "iter": self.iter,
+                            "logs": reverted_logs,
+                            "reverted": True,
+                        })
+                        print(f"[MPC] Added reverted iteration_metrics for iter {self.iter}, total count: {len(self.iteration_metrics)}")
+                        
                         # iter는 증가시키되, 상태 업데이트 없이 다음 반복으로 진행
                         self.iter += 1
                         print(f"[MPC] Iter {self.iter} (reverted due to CD increase)\n")
@@ -159,6 +264,7 @@ class MPCPlanner(BasePlanner):
                     # 첫 번째 iteration: prev_cd 초기화
                     prev_cd = cur_cd.copy()
                     print(f"[MPC] Initial CD: {cur_cd[0]:.6f}")
+            
             new_successes = successes & ~self.is_success  # Identify new successes
             self.is_success = (
                 self.is_success | successes
@@ -168,10 +274,25 @@ class MPCPlanner(BasePlanner):
             )  # Update only for the newly successful trajectories
 
             print("self.is_success: ", self.is_success)
+            
             logs = {f"{self.logging_prefix}/{k}": v for k, v in logs.items()}
             logs.update({"step": self.iter + 1})
-            self.wandb_run.log(logs)
+            
+            # 🔧 WandB 로깅: visual_loss와 chamfer_distance 모두 매 iteration마다 항상 로깅
+            if self.wandb_run is not None:
+                self.wandb_run.log(logs)
+            
+            # iteration_metrics에는 모든 logs 저장 (필터링 없음)
             self.dump_logs(logs)
+            self.iteration_metrics.append(
+                {
+                    "iter": self.iter,
+                    "logs": {k: v for k, v in logs.items()},
+                    "reverted": False,
+                }
+            )
+            self.evaluated_iterations_count += 1  # 실제 평가 수행 횟수 증가
+            print(f"[MPC] Added iteration_metrics for iter {self.iter}, total count: {len(self.iteration_metrics)}, evaluated count: {self.evaluated_iterations_count}")
 
             # update evaluator's init conditions with new env feedback
             e_final_obs = slice_trajdict_with_t(e_obses, start_idx=-1)
@@ -194,15 +315,33 @@ class MPCPlanner(BasePlanner):
             obs_0=init_obs_0,
             state_0=init_state_0,
         )
+        
+        # 🔧 태스크 ID를 포함한 final output 파일명 생성
+        task_id = None
+        if hasattr(self.evaluator, 'workspace') and self.evaluator.workspace is not None:
+            task_id = getattr(self.evaluator.workspace, 'current_task_id', None)
+        final_filename = f"output_final_task_{task_id:02d}" if task_id is not None else "output_final"
+        
         # 전체 궤적을 초기 상태에서 평가
         final_logs, final_successes, final_e_obses, final_e_states = self.evaluator.eval_actions(
             planned_actions,  # 전체 궤적
             self.action_len,
-            filename="output_final",
+            filename=final_filename,
             save_video=True,
         )
         print(f"[MPC] Final output CD: {final_logs.get('mean_chamfer_distance', final_logs.get('chamfer_distance', 'N/A'))}")
         
+        if self.wandb_run is not None:
+            # mean_visual_dist는 visual_loss가 아니므로 로깅하지 않음
+            # 태스크별 final output 로그 키 찾기
+            final_log_key = None
+            for key in final_logs.keys():
+                if "output_final" in key and "chamfer" in key.lower():
+                    final_log_key = key
+                    break
+            if final_log_key:
+                self.wandb_run.log({"chamfer_distance": final_logs[final_log_key]}, step=self.iter)
+
         # 🔧 최종 결과 요약 출력
         print("\n" + "="*80)
         print("[MPC] Final Results Summary")

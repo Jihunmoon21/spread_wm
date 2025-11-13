@@ -24,7 +24,7 @@ BASE_DIR = os.path.abspath(os.path.join(__file__, "../../../../../../"))
 TABLE_COLOR_MAP = {
     "default": np.ones(3, dtype=np.float32) * (160.0 / 255.0),
     "brown": np.array([0.6, 0.4, 0.2], dtype=np.float32),
-    "purple": np.array([0.5, 0.0, 0.5], dtype=np.float32),
+    "purple": np.array([0.75, 0.6, 0.95], dtype=np.float32),
 }
 DEFAULT_TABLE_COLOR_NAME = "default"
 
@@ -153,6 +153,8 @@ class FlexEnv(gym.Env):
         # 전역 카운터: 전체 planning 세션에서 초기 상태 설정 시 최대 3번까지 재센터링
         if not hasattr(FlexEnv, "_global_first_set_states_count"):
             FlexEnv._global_first_set_states_count = 0
+        # Flag to allow unlimited recentering when forced externally
+        self._force_recenter_unlimited = False
 
         self.fps = self.dataset_config["fps"]
         self.fps_number = self.dataset_config["fps_number"]
@@ -165,24 +167,12 @@ class FlexEnv(gym.Env):
     
         self.scene.set_scene(self.obj, self.obj_params)
         
-        # Critical: Immediately verify scene was set successfully
-        # Get particle count to ensure scene initialization completed
-        try:
-            particle_count = pyflex.get_n_particles()
-            print(f"Scene initialized successfully with {particle_count} particles")
-        except Exception as e:
-            print(f"Warning: Could not get particle count after set_scene: {e}")
-        
         # For granular scenes, add extra verification and gentle start
         if self.obj == "granular":
-            # Verify particle positions are valid before first step
             try:
-                particle_positions = pyflex.get_positions()
-                if len(particle_positions) > 0:
-                    pos_reshaped = particle_positions.reshape(-1, 4)
-                    print(f"Particle position check: y_min={pos_reshaped[:, 1].min():.3f}, y_max={pos_reshaped[:, 1].max():.3f}")
-            except Exception as e:
-                print(f"Warning: Could not verify particle positions: {e}")
+                pyflex.get_positions()
+            except Exception:
+                pass
             
             # Add a small delay to ensure GPU context is fully ready
             import time as time_module
@@ -190,11 +180,9 @@ class FlexEnv(gym.Env):
             
             # Start with very gentle steps for granular scenes
             # First few steps with minimal updates to let particles settle
-            print("Starting gentle stabilization for granular scene...")
             for i in range(5):
                 try:
                     pyflex.step(update_params=None, capture=0, path=None, render=0)
-                    print(f"Gentle step {i+1}/5 completed")
                 except Exception as e:
                     print(f"Error during gentle step {i+1}: {e}")
                     # If gentle steps fail, try to continue with normal steps
@@ -202,12 +190,9 @@ class FlexEnv(gym.Env):
             
             # Continue with normal stabilization steps
             stabilize_steps = 30  # Increased from 20
-            print(f"Continuing with {stabilize_steps} stabilization steps...")
             for i in range(stabilize_steps):
                 try:
                     pyflex.step()
-                    if (i + 1) % 10 == 0:
-                        print(f"Stabilization step {i+1}/{stabilize_steps} completed")
                 except Exception as e:
                     print(f"Error during stabilization step {i+1}: {e}")
                     raise
@@ -218,10 +203,8 @@ class FlexEnv(gym.Env):
                 pyflex.step()
         
         # set camera
-        print("Setting camera...")
         try:
             self.camera.set_init_camera(self.camera_view)
-            print("Camera set successfully")
         except Exception as e:
             print(f"Error setting camera: {e}")
             raise
@@ -236,17 +219,14 @@ class FlexEnv(gym.Env):
             ) = self.camera.init_multiview_cameras()
         
         # add table - extra caution for granular scenes
-        print("Adding table...")
         try:
             self.add_table()
-            print("Table added successfully")
         except Exception as e:
             print(f"Error adding table: {e}")
             raise
         
         # Stabilize after adding table - more steps for granular
         stabilize_after_table = 10 if self.obj == "granular" else 5
-        print(f"Stabilizing after table ({stabilize_after_table} steps)...")
         for i in range(stabilize_after_table):
             try:
                 pyflex.step()
@@ -255,16 +235,13 @@ class FlexEnv(gym.Env):
                 raise
         
         ## add robot
-        print("Adding robot...")
         try:
             # Additional stabilization before adding robot meshes
             if self.obj == "granular":
-                print("  Pre-robot stabilization (5 steps)...")
                 for _ in range(5):
                     pyflex.step()
             
             self.add_robot()
-            print("Robot added successfully")
         except Exception as e:
             print(f"Error adding robot: {e}")
             import traceback
@@ -274,76 +251,54 @@ class FlexEnv(gym.Env):
         # Stabilize after adding robot (critical for preventing segfaults)
         # Robot mesh loading can cause issues if PyFlex isn't ready
         stabilize_after_robot = 15 if self.obj == "granular" else 10
-        print(f"Stabilizing after robot ({stabilize_after_robot} steps)...")
-        for i in range(stabilize_after_robot):
+        for step_idx in range(stabilize_after_robot):
             try:
                 pyflex.step()
-                if (i + 1) % 5 == 0:
-                    print(f"Post-robot stabilization step {i+1}/{stabilize_after_robot} completed")
             except Exception as e:
-                print(f"Error during post-robot stabilization step {i+1}: {e}")
+                print(f"Error during post-robot stabilization step {step_idx + 1}: {e}")
                 raise
         
         # Final stabilization before enabling rendering - more for granular
         final_stabilize_steps = 30 if self.obj == "granular" else 20
-        print(f"Final stabilization ({final_stabilize_steps} steps)...")
-        for i in range(final_stabilize_steps):
+        for step_idx in range(final_stabilize_steps):
             try:
                 pyflex.step()
-                if (i + 1) % 10 == 0:
-                    print(f"Final stabilization step {i+1}/{final_stabilize_steps} completed")
             except Exception as e:
-                print(f"Error during final stabilization step {i+1}: {e}")
+                print(f"Error during final stabilization step {step_idx + 1}: {e}")
                 raise
         
         # Ensure camera is properly set
-        print("Re-setting camera...")
         try:
             self.camera.set_init_camera(self.camera_view)
-            print("Camera re-set successfully")
         except Exception as e:
             print(f"Error re-setting camera: {e}")
             raise
         
         # Re-enable rendering now that initialization is complete
-        print("Enabling rendering...")
         self.disable_render = False
         
         # Additional stabilization after enabling rendering - more for granular
         post_render_steps = 15 if self.obj == "granular" else 10
-        print(f"Post-render stabilization ({post_render_steps} steps)...")
-        for i in range(post_render_steps):
+        for step_idx in range(post_render_steps):
             try:
                 pyflex.step()
-                if (i + 1) % 5 == 0:
-                    print(f"Post-render stabilization step {i+1}/{post_render_steps} completed")
             except Exception as e:
-                print(f"Error during post-render stabilization step {i+1}: {e}")
+                print(f"Error during post-render stabilization step {step_idx + 1}: {e}")
                 raise
         
         # Verify rendering works
         headless = bool(self.dataset_config["headless"])
-        if headless:
-            print("Running in headless mode with EGL offscreen rendering enabled")
-        else:
-            print("Running with on-screen OpenGL visualization enabled")
-        
         try:
             # Check particle positions to ensure scene has content
             try:
                 particle_pos = pyflex.get_positions()
                 num_particles = len(particle_pos) // 4
-                print(f"Scene has {num_particles} particles")
                 if num_particles > 0:
                     pos_reshaped = particle_pos.reshape(-1, 4)
-                    print(f"Particle position range: x=[{pos_reshaped[:, 0].min():.2f}, {pos_reshaped[:, 0].max():.2f}], "
-                          f"y=[{pos_reshaped[:, 1].min():.2f}, {pos_reshaped[:, 1].max():.2f}], "
-                          f"z=[{pos_reshaped[:, 2].min():.2f}, {pos_reshaped[:, 2].max():.2f}]")
             except Exception as e:
                 print(f"Warning: Could not get particle positions: {e}")
             
             # Force camera update
-            print(f"Setting camera: pos={self.camera.camPos}, angle={self.camera.camAngle}")
             pyflex.set_camPos(self.camera.camPos)
             pyflex.set_camAngle(self.camera.camAngle)
             
@@ -362,16 +317,11 @@ class FlexEnv(gym.Env):
                     img_max = test_img.max()
                     img_min = test_img.min()
                     
-                    print(f"Render attempt {render_attempt + 1}: shape={test_img.shape}, "
-                          f"mean={img_mean:.3f}, std={img_std:.3f}, min={img_min:.3f}, max={img_max:.3f}")
-                    
                     if np.allclose(test_img, 0):
                         print("Warning: Rendering returned black screen - check EGL/OpenGL setup")
                         if render_attempt < 2:
-                            print("Trying additional steps before next render attempt...")
                             continue
                     else:
-                        print(f"✓ Rendering initialized successfully!")
                         break
                 else:
                     print(f"Warning: Render attempt {render_attempt + 1} returned invalid image")
@@ -426,21 +376,6 @@ class FlexEnv(gym.Env):
         pyflex.add_box(halfEdge, center, quats, hideShape, table_color)
         self.table_shape_states[0] = np.concatenate([center, center, quats, quats])
         
-        # DEBUG: Print workspace table xy (xz plane) corner coordinates
-        # Table is a box with center and halfEdge, so corners are center ± halfEdge
-        # xz plane corners (y = center.y = 0.0, table top is at y = center.y + halfEdge.y = 0.5)
-        table_x_min = center[0] - halfEdge[0]  # x - width
-        table_x_max = center[0] + halfEdge[0]  # x + width
-        table_z_min = center[2] - halfEdge[2]  # z - length
-        table_z_max = center[2] + halfEdge[2]  # z + length
-        print(f"[DEBUG] Workspace table xz plane corners (y=0.0, table top at y={center[1] + halfEdge[1]:.2f}):")
-        print(f"  Corner 1 (SW): ({table_x_min:.2f}, {center[1]:.2f}, {table_z_min:.2f})")
-        print(f"  Corner 2 (SE): ({table_x_max:.2f}, {center[1]:.2f}, {table_z_min:.2f})")
-        print(f"  Corner 3 (NE): ({table_x_max:.2f}, {center[1]:.2f}, {table_z_max:.2f})")
-        print(f"  Corner 4 (NW): ({table_x_min:.2f}, {center[1]:.2f}, {table_z_max:.2f})")
-        print(f"  Table center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
-        print(f"  Table size: width={2*halfEdge[0]:.2f}, length={2*halfEdge[2]:.2f}, height={2*halfEdge[1]:.2f}")
-
         # table for robot
         if self.obj in ["cloth"]:
             robot_table_height = 0.5 + 1.0
@@ -455,19 +390,6 @@ class FlexEnv(gym.Env):
         pyflex.add_box(halfEdge, center, quats, hideShape, table_color)
         self.table_shape_states[1] = np.concatenate([center, center, quats, quats])
         
-        # DEBUG: Print robot table xy (xz plane) corner coordinates
-        robot_table_x_min = center[0] - halfEdge[0]
-        robot_table_x_max = center[0] + halfEdge[0]
-        robot_table_z_min = center[2] - halfEdge[2]
-        robot_table_z_max = center[2] + halfEdge[2]
-        print(f"[DEBUG] Robot table xz plane corners (y=0.0, table top at y={center[1] + halfEdge[1]:.2f}):")
-        print(f"  Corner 1 (SW): ({robot_table_x_min:.2f}, {center[1]:.2f}, {robot_table_z_min:.2f})")
-        print(f"  Corner 2 (SE): ({robot_table_x_max:.2f}, {center[1]:.2f}, {robot_table_z_min:.2f})")
-        print(f"  Corner 3 (NE): ({robot_table_x_max:.2f}, {center[1]:.2f}, {robot_table_z_max:.2f})")
-        print(f"  Corner 4 (NW): ({robot_table_x_min:.2f}, {center[1]:.2f}, {robot_table_z_max:.2f})")
-        print(f"  Robot table center: ({center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f})")
-        print(f"  Robot table size: width={2*halfEdge[0]:.2f}, length={2*halfEdge[2]:.2f}, height={2*halfEdge[1]:.2f}")
-
     def add_robot(self):
         if self.obj in ["granular"]:
             # flat board pusher
@@ -665,12 +587,8 @@ class FlexEnv(gym.Env):
         for _ in range(50):
             pyflex.step()
         # 🔧 final output 계산 시에만 재센터링 (force_recenter 파라미터 또는 플래그 확인)
-        # 일반적인 reset()에서는 재센터링하지 않음
-        # 파라미터로 전달된 force_recenter를 우선 사용, 없으면 플래그 확인
-        if not force_recenter:
-            force_recenter = getattr(self, '_force_recenter_after_set_states', False)
-        if force_recenter:
-            self._recenter_particles_xz()
+        # 🔧 모든 경우에 재센터링 적용
+        self._recenter_particles_xz()
 
         # save initial rendering
         if save_data:
@@ -897,20 +815,6 @@ class FlexEnv(gym.Env):
             else:
                 self._render_debug_count = 1
             
-            if self._render_debug_count <= 3:  # Only print first few times
-                try:
-                    particle_pos = pyflex.get_positions()
-                    if particle_pos.size > 0:
-                        pos_reshaped = particle_pos.reshape(-1, 4)
-                        print(f"[Render Debug {self._render_debug_count}] Particle positions: "
-                              f"count={len(pos_reshaped)}, "
-                              f"x=[{pos_reshaped[:, 0].min():.2f}, {pos_reshaped[:, 0].max():.2f}], "
-                              f"y=[{pos_reshaped[:, 1].min():.2f}, {pos_reshaped[:, 1].max():.2f}], "
-                              f"z=[{pos_reshaped[:, 2].min():.2f}, {pos_reshaped[:, 2].max():.2f}]")
-                        print(f"  Camera: pos={self.camera.camPos}, angle={self.camera.camAngle}")
-                except Exception as e:
-                    print(f"[Render Debug] Could not get particle positions: {e}")
-            
             # Try rendering - pyflex.render() returns a tuple (image, depth)
             
             render_result = None
@@ -944,8 +848,6 @@ class FlexEnv(gym.Env):
             
             if render_result is None or (hasattr(render_result, 'size') and render_result.size == 0):
                 # Return black screen if rendering fails
-                if self._render_debug_count <= 3:
-                    print(f"[Render Debug {self._render_debug_count}] Render returned None or empty")
                 return np.zeros((self.screenHeight, self.screenWidth, 5), dtype=np.float32)
             
             # Reshape result - handle different output formats and vertically flip output
@@ -1124,14 +1026,7 @@ class FlexEnv(gym.Env):
     def _recenter_particles_xz(self):
         """Translate particles so that their xz center is at (0, 0)."""
         try:
-            # Skip recentering after it has already run three times
-            if (
-                hasattr(self, "_recentering_calls") and self._recentering_calls >= 9
-            ) or (
-                hasattr(FlexEnv, "_global_recentering_calls")
-                and FlexEnv._global_recentering_calls >= 9
-            ):
-                return
+            # 🔧 모든 경우에 재센터링 적용 (제한 제거)
             pos = pyflex.get_positions()
             if pos is None or len(pos) == 0:
                 return
@@ -1145,17 +1040,19 @@ class FlexEnv(gym.Env):
             pos4[:, 0] -= cx
             pos4[:, 2] -= cz
             pyflex.set_positions(pos4.reshape(-1))
-            pos_after = pyflex.get_positions().reshape(-1, 4)
-            ax_min, ax_max = pos_after[:, 0].min(), pos_after[:, 0].max()
-            az_min, az_max = pos_after[:, 2].min(), pos_after[:, 2].max()
-            print(f"[DEBUG] After recenter x=[{ax_min:.2f}, {ax_max:.2f}], z=[{az_min:.2f}, {az_max:.2f}]")
-            # Count successful recentering executions
+            # Count successful recentering executions (참고용, 제한 없음)
             if hasattr(self, "_recentering_calls"):
                 self._recentering_calls += 1
             if hasattr(FlexEnv, "_global_recentering_calls"):
                 FlexEnv._global_recentering_calls += 1
         except Exception as e:
             print(f"[DEBUG] Recentering failed: {e}")
+
+    def reset_recentering_counters(self):
+        """Reset recentering counters so that forced recentering can run again."""
+        self._recentering_calls = 0
+        FlexEnv._global_recentering_calls = 0
+        self._force_recenter_unlimited = True
 
 
     def get_num_particles(self):
@@ -1171,19 +1068,8 @@ class FlexEnv(gym.Env):
         if states is not None:
             # self.scene.set_scene(self.obj)
             pyflex.set_positions(states)
-            # 🔧 재센터링 조건:
-            # 1. force_recenter=True (final output에서만)
-            # 2. _first_set_states=True AND _global_first_set_states_count < 3 (초기 상태 설정 시 전체 세션에서 최대 3번까지)
-            should_recenter = False
-            if force_recenter:
-                should_recenter = True
-            elif self._first_set_states and FlexEnv._global_first_set_states_count < 5:
-                should_recenter = True
-                FlexEnv._global_first_set_states_count += 1
-                print(f"[DEBUG] set_states() - _first_set_states=True (initial state, count={FlexEnv._global_first_set_states_count}/3), calling _recenter_particles_xz()")
-            
-            if should_recenter:
-                self._recenter_particles_xz()
+            # 🔧 모든 경우에 재센터링 적용
+            self._recenter_particles_xz()
             # _first_set_states 플래그 리셋 (한 번만 실행되도록)
             if self._first_set_states:
                 self._first_set_states = False
