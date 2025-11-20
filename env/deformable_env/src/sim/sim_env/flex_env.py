@@ -26,7 +26,7 @@ TABLE_COLOR_MAP = {
     "brown": np.array([0.6, 0.4, 0.2], dtype=np.float32),
     "purple": np.array([0.75, 0.6, 0.95], dtype=np.float32),
 }
-DEFAULT_TABLE_COLOR_NAME = "default"
+DEFAULT_TABLE_COLOR_NAME = "brown"
 
 class FlexEnv(gym.Env):
     def __init__(self, config=None) -> None:

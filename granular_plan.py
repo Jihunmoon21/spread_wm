@@ -1109,14 +1109,14 @@ def planning_main(cfg_dict):
 
     # 연속 학습 태스크 시퀀스 정의
     task_sequence = [
-        {"table_color": "purple", "camera_view": 0},
-        {"table_color": "brown"},
-        {"granular_radius": 0.25, "camera_view": 0},
-        {"table_color": "brown", "granular_radius": 0.25},
-        {"camera_view": 0},
-        {"table_color": "purple"},
-        {"table_color": "brown", "camera_view": 0},
-        {"table_color": "purple", "granular_radius": 0.25},
+        {"table_color": "brown"},  # Task 1: 기본 설정
+        {"table_color": "purple", "camera_view": 0, "granular_radius": 0.25},  # Task 2: 모든 파라미터 변경 (CF 최대화)
+        {"table_color": "brown", "camera_view": 0},  # Task 3: brown + camera (Task 1과 차이)
+        {"table_color": "purple", "granular_radius": 0.25},  # Task 4: purple + radius (Task 2와 차이)
+        {"camera_view": 0},  # Task 5: camera만 (기본 테이블 색상)
+        {"table_color": "brown", "granular_radius": 0.25},  # Task 6: brown + radius
+        {"table_color": "purple", "camera_view": 0},  # Task 7: purple + camera
+        {"granular_radius": 0.25, "camera_view": 0},  # Task 8: radius + camera (기본 테이블 색상)
     ]
     mpc_iters_per_task = 25    # 각 태스크당 최대 MPC iteration 수
     overall_logs = []
@@ -1505,7 +1505,7 @@ def planning_main(cfg_dict):
                         _log_to_wandb("visual_loss", ft["visual_loss"])
                     if "chamfer_distance" in ft:
                         _log_to_wandb("chamfer_distance", ft["chamfer_distance"])
-        else:
+    else:
             failures.append(result)
             print(f"⚠️  Task {task_idx + 1} failed with status {result['status']}: {result.get('error')}")
 

@@ -140,8 +140,8 @@ class PlanWorkspace:
         self.current_task_id = current_task_id  # 현재 태스크 ID 저장
         self.device = next(wm.parameters()).device
         
-        # 🔧 시드를 고정된 값으로 설정 (재현성 보장)
-        self.eval_seed = [42] * cfg_dict["n_evals"]  # 모든 평가에서 동일한 시드 사용
+        # 🔧 각 평가마다 다른 시드 사용 (다양성 보장)
+        self.eval_seed = [cfg_dict["seed"] * n + 1 for n in range(cfg_dict["n_evals"])]
         print("eval_seed: ", self.eval_seed)
         self.n_evals = cfg_dict["n_evals"]
         self.goal_source = cfg_dict["goal_source"]
@@ -440,11 +440,19 @@ def load_ckpt(snapshot_path, device):
         payload = torch.load(f, map_location=device, weights_only=False)
     loaded_keys = []
     result = {}
+    # 디버깅: 체크포인트에 있는 모든 키 출력
+    print(f"Checkpoint keys: {list(payload.keys())}")
     for k, v in payload.items():
         if k in ALL_MODEL_KEYS:
             loaded_keys.append(k)
-            result[k] = v.to(device)
-    result["epoch"] = payload["epoch"]
+            # None 체크 추가 (dummy checkpoint 지원)
+            if v is not None:
+                result[k] = v.to(device)
+            else:
+                result[k] = None
+    result["epoch"] = payload.get("epoch", 0)
+    print(f"Loaded model keys: {loaded_keys}")
+    print(f"Missing model keys: {set(ALL_MODEL_KEYS) - set(loaded_keys)}")
     return result
 
 def load_model(model_ckpt, train_cfg, num_action_repeat, device):
@@ -452,13 +460,19 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
     if model_ckpt.exists():
         result = load_ckpt(model_ckpt, device)
         print(f"Resuming from epoch {result['epoch']}: {model_ckpt}")
+    else:
+        raise FileNotFoundError(f"Model checkpoint not found: {model_ckpt}")
 
     if "encoder" not in result:
         result["encoder"] = hydra.utils.instantiate(
             train_cfg.encoder,
         )
     if "predictor" not in result:
-        raise ValueError("Predictor not found in model checkpoint")
+        raise ValueError(
+            f"Predictor not found in model checkpoint: {model_ckpt}\n"
+            f"Available keys in checkpoint: {list(result.keys())}\n"
+            f"Expected keys: {ALL_MODEL_KEYS}"
+        )
 
     if train_cfg.has_decoder and "decoder" not in result:
         base_path = os.path.dirname(os.path.abspath(__file__))
@@ -494,20 +508,28 @@ def load_model(model_ckpt, train_cfg, num_action_repeat, device):
     return model
 
 
-def measure_forgetting_on_past_tasks(model, past_task_envs, plan_workspace, current_task_id):
+def measure_forgetting_on_past_tasks(model, past_task_envs, plan_workspace, current_task_id, ensemble_cache_dir=None):
     """
     과거 태스크들에 대한 현재 모델의 성능을 측정하여 파국적 망각을 분석합니다.
+    granular_plan.py처럼 해당 태스크의 앙상블 멤버를 로드하여 평가합니다.
     
     Args:
         model: 현재 학습된 모델
         past_task_envs: 과거 태스크 환경들의 리스트
         plan_workspace: 현재 플래닝 워크스페이스
         current_task_id: 현재 태스크 ID
+        ensemble_cache_dir: 앙상블 멤버 캐시 디렉토리 경로
     
     Returns:
-        forgetting_results: 각 과거 태스크에 대한 성능 측정 결과
+        forgetting_results: 각 과거 태스크에 대한 성능 측정 결과 (현재 모델 + 앙상블 멤버)
     """
     forgetting_results = []
+    device = next(model.parameters()).device
+    
+    # 앙상블 캐시 디렉토리 설정
+    if ensemble_cache_dir is None:
+        ensemble_cfg = plan_workspace.cfg_dict.get("lora", {}).get("ensemble_cfg", {})
+        ensemble_cache_dir = os.path.abspath(ensemble_cfg.get("cache_dir", "./lora_cache"))
     
     for past_task in past_task_envs[:-1]:  # 마지막(현재) 태스크 제외
         past_task_id = past_task['task_id']
@@ -516,55 +538,113 @@ def measure_forgetting_on_past_tasks(model, past_task_envs, plan_workspace, curr
         
         print(f"   Testing on Task {past_task_id}: {past_env_config}")
         
-        try:
-            # 과거 태스크 환경에서 플래닝 수행
-            past_plan_workspace = PlanWorkspace(
-                cfg_dict=plan_workspace.cfg_dict.copy(),
-                wm=model,  # 현재 학습된 모델 사용
-                dset=plan_workspace.dset,
-                env=past_env,
-                env_name=plan_workspace.env_name,
-                frameskip=plan_workspace.frameskip,
-                wandb_run=None,  # 망각 측정 시에는 wandb 로깅 비활성화
-            )
+        # 두 가지 모드로 측정: 현재 모델과 앙상블 멤버
+        for mode_label, use_ensemble_member in [("current_model", False), ("ensemble_member", True)]:
+            if use_ensemble_member and not plan_workspace.is_online_lora:
+                continue  # 앙상블이 없으면 건너뜀
             
-            # 간단한 성능 측정 (1회 플래닝)
-            logs = past_plan_workspace.perform_planning()
-            
-            # 성능 지표 추출
-            success_rate = logs.get('success_rate', 0.0)
-            avg_loss = None
-            
-            # Loss 측정 (온라인 LoRA가 활성화된 경우)
-            if (past_plan_workspace.is_online_lora and 
-                hasattr(past_plan_workspace.online_learner, 'last_loss') and
-                past_plan_workspace.online_learner.last_loss is not None):
-                avg_loss = past_plan_workspace.online_learner.last_loss
-            
-            # 망각 측정 결과 저장
-            result = {
-                'past_task_id': past_task_id,
-                'current_task_id': current_task_id,
-                'env_config': past_env_config,
-                'success_rate': success_rate,
-                'avg_loss': avg_loss if avg_loss is not None else 0.0
-            }
-            forgetting_results.append(result)
-            
-            avg_loss_str = f"{avg_loss:.6f}" if avg_loss is not None else "N/A"
-            print(f"     → Task {past_task_id} Success Rate: {success_rate:.3f}, Loss: {avg_loss_str}")
-            
-        except Exception as e:
-            print(f"     → Error measuring Task {past_task_id}: {e}")
-            # 오류 발생 시 기본값으로 기록
-            forgetting_results.append({
-                'past_task_id': past_task_id,
-                'current_task_id': current_task_id,
-                'env_config': past_env_config,
-                'success_rate': 0.0,
-                'avg_loss': 0.0,
-                'error': str(e)
-            })
+            try:
+                # 과거 태스크 환경에서 플래닝 수행
+                past_plan_workspace = PlanWorkspace(
+                    cfg_dict=plan_workspace.cfg_dict.copy(),
+                    wm=model,  # 현재 학습된 모델 사용
+                    dset=plan_workspace.dset,
+                    env=past_env,
+                    env_name=plan_workspace.env_name,
+                    frameskip=plan_workspace.frameskip,
+                    wandb_run=None,  # 망각 측정 시에는 wandb 로깅 비활성화
+                    current_task_id=past_task_id,
+                )
+                
+                # 앙상블 멤버 로드 (해당 태스크의 멤버)
+                loaded_file = "N/A"
+                if use_ensemble_member:
+                    ensemble_member_lora_path = os.path.join(
+                        ensemble_cache_dir, f"lora_task_{past_task_id}.pth"
+                    )
+                    if os.path.exists(ensemble_member_lora_path):
+                        try:
+                            lora_weights = torch.load(ensemble_member_lora_path, map_location=device)
+                            learner = getattr(past_plan_workspace, "online_learner", None)
+                            if (
+                                past_plan_workspace.is_online_lora
+                                and learner is not None
+                                and hasattr(learner, "_apply_lora_weights")
+                            ):
+                                success = learner._apply_lora_weights(lora_weights)
+                                if success and hasattr(learner, "last_selected_member_task_id"):
+                                    setattr(learner, "last_selected_member_task_id", past_task_id)
+                                loaded_file = os.path.basename(ensemble_member_lora_path)
+                                print(f"     📥 Loaded ensemble member for Task {past_task_id} from {loaded_file}")
+                            else:
+                                print(f"     ⚠️  Could not apply LoRA weights (is_online_lora={past_plan_workspace.is_online_lora})")
+                        except Exception as e:
+                            print(f"     ⚠️  Failed to load ensemble member for Task {past_task_id}: {e}")
+                            continue
+                    else:
+                        print(f"     ⚠️  Ensemble member file not found: {ensemble_member_lora_path}")
+                        continue
+                else:
+                    # 현재 모델 모드: 현재 태스크의 LoRA 사용 (있는 경우)
+                    current_model_lora_path = os.path.join(
+                        ensemble_cache_dir, f"lora_task_{current_task_id}.pth"
+                    )
+                    if os.path.exists(current_model_lora_path):
+                        try:
+                            lora_weights = torch.load(current_model_lora_path, map_location=device)
+                            learner = getattr(past_plan_workspace, "online_learner", None)
+                            if (
+                                past_plan_workspace.is_online_lora
+                                and learner is not None
+                                and hasattr(learner, "_apply_lora_weights")
+                            ):
+                                learner._apply_lora_weights(lora_weights)
+                                loaded_file = os.path.basename(current_model_lora_path)
+                                print(f"     📥 Loaded current model LoRA from {loaded_file}")
+                        except Exception as e:
+                            print(f"     ⚠️  Failed to load current model LoRA: {e}")
+                
+                # 간단한 성능 측정 (1회 플래닝)
+                logs = past_plan_workspace.perform_planning()
+                
+                # 성능 지표 추출
+                success_rate = logs.get('success_rate', 0.0)
+                avg_loss = None
+                
+                # Loss 측정 (온라인 LoRA가 활성화된 경우)
+                if (past_plan_workspace.is_online_lora and 
+                    hasattr(past_plan_workspace.online_learner, 'last_loss') and
+                    past_plan_workspace.online_learner.last_loss is not None):
+                    avg_loss = past_plan_workspace.online_learner.last_loss
+                
+                # 망각 측정 결과 저장
+                result = {
+                    'past_task_id': past_task_id,
+                    'current_task_id': current_task_id,
+                    'env_config': past_env_config,
+                    'mode': mode_label,
+                    'success_rate': success_rate,
+                    'avg_loss': avg_loss if avg_loss is not None else 0.0,
+                    'loaded_file': loaded_file
+                }
+                forgetting_results.append(result)
+                
+                avg_loss_str = f"{avg_loss:.6f}" if avg_loss is not None else "N/A"
+                print(f"     → Task {past_task_id} ({mode_label}): Success Rate: {success_rate:.3f}, Loss: {avg_loss_str} [loaded: {loaded_file}]")
+                
+            except Exception as e:
+                print(f"     → Error measuring Task {past_task_id} ({mode_label}): {e}")
+                # 오류 발생 시 기본값으로 기록
+                forgetting_results.append({
+                    'past_task_id': past_task_id,
+                    'current_task_id': current_task_id,
+                    'env_config': past_env_config,
+                    'mode': mode_label,
+                    'success_rate': 0.0,
+                    'avg_loss': 0.0,
+                    'error': str(e),
+                    'loaded_file': loaded_file if 'loaded_file' in locals() else "N/A"
+                })
     
     return forgetting_results
 
@@ -621,45 +701,23 @@ def planning_main(cfg_dict):
     # --- ▼ 2. 연속 학습을 위한 태스크 정의 ▼ ---
     # 11개의 서로 다른 환경 설정을 정의합니다.
     task_configs = [
+        {'shape': 'T', 'color': 'Yellow', 'background_color': 'White'},             # Task 8: 블록 노랑
+
+
+        {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
+        {'shape': 'T', 'color': 'Black', 'background_color': 'Red'},              # Task 11: 블록 검정 + 배경 빨강
+
+        # 복합적 변화 (맨 뒤에 배치)
+        {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'Black'}, # Task 9: 정사각형 + 배경 검정
+        # 블록 모양 변화
+        {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
+
         {'shape': 'T',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
-        #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
-        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        {'shape': 'square',       'color': 'Yellow',         'background_color': 'White'},  # Task 2: B (shape+color shift)
-        #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
-        #{'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
-        #{'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 3: A' (appearance conflict)
-        #{'shape': 'T',       'color': 'Black',          'background_color': 'Red'},    # Task 5: A' (appearance conflict)
-        # # Original (기본 설정)
-        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
-        
-        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
-        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'White'},
-        # # 블록 모양 변화
-        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
-        #{'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
-        # {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 2: 정사각형
 
-        # {'shape': 'small_tee', 'color': 'LightSlateGray', 'background_color': 'White'}, # Task 3: small_tee
-        # {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
+        {'shape': 'L', 'color': 'Yellow', 'background_color': 'White'},             # Task 10: L + 블록 노랑
 
-        # # 블록 색상 변화
-        # {'shape': 'T', 'color': 'Black', 'background_color': 'White'},              # Task 7: 블록 검정
-        # {'shape': 'T', 'color': 'Yellow', 'background_color': 'White'},             # Task 8: 블록 노랑
-
-        # # 배경색 변화
-        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Black'},      # Task 5: 배경 검정
-        # {'shape': 'T', 'color': 'LightSlateGray', 'background_color': 'Red'},       # Task 6: 배경 빨강
-        
-        # # 복합적 변화 (맨 뒤에 배치)
-        # {'shape': 'square', 'color': 'LightSlateGray', 'background_color': 'Black'}, # Task 9: 정사각형 + 배경 검정
-        # {'shape': 'L', 'color': 'Yellow', 'background_color': 'White'},             # Task 10: L + 블록 노랑
-        # {'shape': 'T', 'color': 'Black', 'background_color': 'Red'},              # Task 11: 블록 검정 + 배경 빨강
+        # 블록 색상 변화
+        {'shape': 'L',       'color': 'LightSlateGray', 'background_color': 'White'},  # Task 1: A (baseline)
     ]
     num_tasks = len(task_configs)
     overall_logs = []
@@ -671,6 +729,10 @@ def planning_main(cfg_dict):
     # 파국적 망각 측정을 위한 변수들
     past_task_envs = []  # 과거 태스크 환경들 저장
     forgetting_metrics = []  # 각 태스크에서의 과거 성능 측정 결과
+    
+    # 앙상블 캐시 디렉토리 설정
+    ensemble_cfg = cfg_dict.get("lora", {}).get("ensemble_cfg", {})
+    ensemble_cache_dir = os.path.abspath(ensemble_cfg.get("cache_dir", "./lora_cache"))
 
     # --- ▼ 3. 태스크를 순회하는 최상위 제어 루프 생성 ▼ ---
     for task_id, env_config in enumerate(task_configs):
@@ -928,6 +990,17 @@ def planning_main(cfg_dict):
                 current_task_for_save = getattr(plan_workspace.online_learner, 'current_task_id', task_id + 1)
                 print(f"💾 Saving finalized LoRA member for Task {current_task_for_save} at task end...")
                 plan_workspace.online_learner.save_current_lora_member(task_id=current_task_for_save, reason="task_end")
+                
+                # 🔧 디스크에 저장 (granular_plan.py와 동일한 로직)
+                if (hasattr(plan_workspace.online_learner, 'ensemble_manager') and
+                    plan_workspace.online_learner.ensemble_manager is not None):
+                    manager = plan_workspace.online_learner.ensemble_manager
+                    if current_task_for_save in manager.ensemble_members:
+                        try:
+                            manager._save_member_to_disk(current_task_for_save, manager.ensemble_members[current_task_for_save])
+                            print(f"💾 Saved LoRA member for Task {current_task_for_save} to disk: {os.path.join(manager.cache_dir, f'lora_task_{current_task_for_save}.pth')}")
+                        except Exception as e:
+                            print(f"⚠️  Failed to save LoRA member to disk for Task {current_task_for_save}: {e}")
         except Exception as e:
             print(f"⚠️  Failed to save finalized LoRA member at task end: {e}")
 
@@ -969,7 +1042,7 @@ def planning_main(cfg_dict):
         if len(past_task_envs) > 1:  # 첫 번째 태스크 이후부터 측정
             print(f"\n🧠 Measuring Catastrophic Forgetting...")
             forgetting_results = measure_forgetting_on_past_tasks(
-                model, past_task_envs, plan_workspace, task_id
+                model, past_task_envs, plan_workspace, task_id, ensemble_cache_dir
             )
             forgetting_metrics.append(forgetting_results)
             
@@ -977,8 +1050,10 @@ def planning_main(cfg_dict):
             print(f"📊 Forgetting Analysis for Task {task_id + 1}:")
             for result in forgetting_results:
                 avg_loss_str = f"{result['avg_loss']:.6f}" if result['avg_loss'] is not None else "N/A"
-                print(f"   - Task {result['past_task_id']}: Success Rate {result['success_rate']:.3f}, "
-                      f"Loss {avg_loss_str}")
+                mode_label = result.get('mode', 'unknown')
+                loaded_file = result.get('loaded_file', 'N/A')
+                print(f"   - Task {result['past_task_id']} ({mode_label}): Success Rate {result['success_rate']:.3f}, "
+                      f"Loss {avg_loss_str} [loaded: {loaded_file}]")
 
         # 리소스 정리를 위해 현재 태스크의 환경을 닫습니다.
         # env.close()  # 과거 태스크 측정을 위해 환경을 닫지 않음
@@ -1064,17 +1139,20 @@ def planning_main(cfg_dict):
             for result in forgetting_results:
                 past_task_id = result['past_task_id']
                 avg_loss = result['avg_loss']
+                mode_label = result.get('mode', 'unknown')
+                loaded_file = result.get('loaded_file', 'N/A')
                 if avg_loss is not None and avg_loss > 0:
                     all_losses.append(avg_loss)
                 
-                # 각 과거 태스크별 평균 loss 계산
-                if past_task_id not in task_loss_summary:
-                    task_loss_summary[past_task_id] = []
-                task_loss_summary[past_task_id].append(avg_loss)
+                # 각 과거 태스크별 평균 loss 계산 (모드별로 구분)
+                key = f"{past_task_id}_{mode_label}"
+                if key not in task_loss_summary:
+                    task_loss_summary[key] = []
+                task_loss_summary[key].append(avg_loss)
                 
                 env_str = f"{result['env_config'].get('shape', 'N/A')}-{result['env_config'].get('color', 'N/A')}-{result['env_config'].get('background_color', 'N/A')}"
                 loss_str = f"{avg_loss:.6f}" if avg_loss is not None else "N/A"
-                print(f"   Task {past_task_id} ({env_str}): Loss {loss_str}")
+                print(f"   Task {past_task_id} ({mode_label}, {env_str}): Loss {loss_str} [loaded: {loaded_file}]")
         
         # 전체 망각 분석
         if all_losses:
@@ -1088,13 +1166,24 @@ def planning_main(cfg_dict):
             print(f"   - Maximum Loss: {max_loss:.6f}")
             print(f"   - Total Measurements: {len(all_losses)}")
             
-            # 각 태스크별 평균 loss
+            # 각 태스크별 평균 loss (모드별로 구분)
             print(f"\n📈 TASK-SPECIFIC LOSS SUMMARY:")
-            for past_task_id in sorted(task_loss_summary.keys()):
-                valid_losses = [loss for loss in task_loss_summary[past_task_id] if loss is not None and loss > 0]
-                if valid_losses:
-                    avg_loss_for_task = sum(valid_losses) / len(valid_losses)
-                    print(f"   Task {past_task_id}: {avg_loss_for_task:.6f} average loss")
+            # 태스크 ID별로 그룹화
+            task_grouped = {}
+            for key, losses in task_loss_summary.items():
+                parts = key.split('_', 1)
+                if len(parts) == 2:
+                    task_id, mode = parts
+                    if task_id not in task_grouped:
+                        task_grouped[task_id] = {}
+                    task_grouped[task_id][mode] = losses
+            
+            for past_task_id in sorted(task_grouped.keys(), key=int):
+                for mode in sorted(task_grouped[past_task_id].keys()):
+                    valid_losses = [loss for loss in task_grouped[past_task_id][mode] if loss is not None and loss > 0]
+                    if valid_losses:
+                        avg_loss_for_task = sum(valid_losses) / len(valid_losses)
+                        print(f"   Task {past_task_id} ({mode}): {avg_loss_for_task:.6f} average loss")
             
             # 망각 심각도 평가 (loss 기반)
             print(f"\n⚠️  FORGETTING SEVERITY ASSESSMENT:")

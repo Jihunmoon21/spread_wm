@@ -1,4 +1,5 @@
 import os
+import inspect
 import torch
 import imageio
 import numpy as np
@@ -195,12 +196,23 @@ class PlanEvaluator:  # evaluator for planning
                     print(f"[EVAL] Re-set _force_recenter_after_set_states=True for env[{i}], verified={flag_after}")
         
         # 🔧 final output인 경우 force_recenter 파라미터를 직접 전달
-        e_obses, e_states = self.env.rollout(
-            self.seed,
-            self.state_0,
-            exec_actions,
-            force_recenter=force_recenter_for_rollout,
-        )
+        # BaseVectorEnv는 force_recenter를 지원하지 않으므로 조건부로 전달
+        rollout_sig = inspect.signature(self.env.rollout)
+        if 'force_recenter' in rollout_sig.parameters:
+            e_obses, e_states = self.env.rollout(
+                self.seed,
+                self.state_0,
+                exec_actions,
+                force_recenter=force_recenter_for_rollout,
+            )
+        else:
+            # force_recenter를 지원하지 않는 환경 (BaseVectorEnv 등)
+            # 플래그 방식만 사용 (이미 위에서 설정됨)
+            e_obses, e_states = self.env.rollout(
+                self.seed,
+                self.state_0,
+                exec_actions,
+            )
         # # ======================================================= #
         # LoRA 학습이 활성화된 경우, 학습 책임을 OnlineLora 객체에 위임합니다.
         if (

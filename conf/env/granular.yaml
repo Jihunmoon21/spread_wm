@@ -6,7 +6,7 @@ dataset:
     # area: 1.5
     xz_ratio: 1.0
     granular_dis: 0.03 # 0.15
-    radius: 0.15
+    radius: 0.25
 
   # data collection
   base: 0
@@ -15,7 +15,7 @@ dataset:
   n_worker: 40
   
   # sim env
-  headless: true # False: OpenGL visualization
+  headless: false # False: OpenGL visualization
   camera_view: 1 # 0 (top view), 1, 2, 3, 4 # 환경 변화
   screenWidth: 224 # 224
   screenHeight: 224 # 224

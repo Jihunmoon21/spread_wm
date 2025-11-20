@@ -108,7 +108,7 @@ def rope_scene(obj_params):
 
 
 def granular_scene(obj_params):
-    radius = float(obj_params.get("radius", 0.15))
+    radius = float(obj_params.get("radius", 0.25))
     # print(1/0)
 
     # granular_scale = rand_float(0.1, 0.3)

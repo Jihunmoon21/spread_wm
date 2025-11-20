@@ -27,7 +27,7 @@ hydra:
 # model to load for planning
 ckpt_base_path: /home/jihun/spread # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
 model_name: null
-model_epoch: 1 # latest # 임의 조정
+model_epoch: latest # latest # 임의 조정
 
 seed: 99
 n_evals: 10 # 25
@@ -50,7 +50,7 @@ lora:
   online: true
   ensemble: true                  # ← 기존 ensemble_lora.enabled 대체
   no_ensemble_control: false     # 대조군 모드: true 시 앙상블 평가 없이 최근 멤버만 사용
-  lr: 0.005                    # LoRA learning rate (기본값: 1e-4)
+  lr: 0.001                    # LoRA learning rate (기본값: 1e-4)
   visual_loss_weight: 1.0
   proprio_loss_weight: 0.5
   ensemble_forgetting: false
@@ -58,9 +58,9 @@ lora:
   # 태스크 전환: loss 기반 전환 설정
   task_switch:
     enabled: true
-    loss_threshold: 0.10          # 최근 윈도우 평균 손실이 이 값 이하로 수렴하면 전환
-    max_planning_per_task: 300     # 태스크당 최대 플래닝 반복 횟수
-    min_planning_per_task: 5      # 최소 플래닝 반복 후부터 전환 조건 평가
+    loss_threshold: 0.01          # 최근 윈도우 평균 손실이 이 값 이하로 수렴하면 전환
+    max_planning_per_task: 25     # 태스크당 최대 플래닝 반복 횟수
+    min_planning_per_task: 1      # 최소 플래닝 반복 후부터 전환 조건 평가
     loss_window_size: 3           # 전환 판단에 사용할 최근 loss 윈도우 크기
   
   # 하이브리드 적층 설정(기존 유지)
@@ -88,7 +88,7 @@ lora:
       select_best_member: true
       stack_on_selected: true
       task_specific_evaluation: true
-      evaluation_loss_threshold: 0.15
+      evaluation_loss_threshold: 0.05
       task_change_evaluation_steps: 1
     consolidation_method: "best_only"
     consolidate_after_tasks: 5
